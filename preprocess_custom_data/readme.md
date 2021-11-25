@@ -54,7 +54,7 @@ cd colmap_preprocess
 python img2poses.py ${data_dir}
 ```
 
-After running the commands below, a sparse point cloud is saved in `${data_dir}/sparse_points.ply`.
+After running the commands above, a sparse point cloud is saved in `${data_dir}/sparse_points.ply`.
 
 **Step 2. Define the region of interest**
 
