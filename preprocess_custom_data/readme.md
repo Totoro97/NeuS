@@ -10,7 +10,7 @@
 
 ### Option 1. Use ArUco 
 
-We take the images in `examples/thin_catbus` for example. These images were captured with an ArUco board.
+We take the images in `examples/thin_catbus` for example. These images were captured with an ArUco board. The pattern image of this board can be found in `./static/aruco_board.png`.
 
 **Step 1. Build the calibration code (c++)**  
 
