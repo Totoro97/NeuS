@@ -94,17 +94,18 @@ class SDFNetwork(nn.Module):
         return self.forward(x)
 
     def gradient(self, x):
-        x.requires_grad_(True)
-        y = self.sdf(x)
-        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
-        gradients = torch.autograd.grad(
-            outputs=y,
-            inputs=x,
-            grad_outputs=d_output,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True)[0]
-        return gradients.unsqueeze(1)
+        with torch.enable_grad():
+            x.requires_grad_(True)
+            y = self.sdf(x)
+            d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+            gradients = torch.autograd.grad(
+                outputs=y,
+                inputs=x,
+                grad_outputs=d_output,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True)[0]
+            return gradients.unsqueeze(1)
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr

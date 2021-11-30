@@ -78,14 +78,13 @@ class Dataset:
         self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
 
         # Load images
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
-        self.n_images = len(self.images_lis)
-        self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 255.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 255.0
-
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
+        images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        self.n_images = len(images_lis)
+        # [n_images, H, W, 3], uint8
+        self.images = np.stack([cv.imread(im_name) for im_name in images_lis])
+        masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
+        # [n_images, H, W, 1], uint8
+        self.masks = np.stack([cv.imread(im_name)[..., 0] for im_name in masks_lis])
 
         # Load camera parameters
         self.pose_all, self.intrinsics_all, self.scale_mats_np, self.focal = \
@@ -102,17 +101,24 @@ class Dataset:
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
-
-        object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
-        object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # Object scale mat: region of interest to **extract mesh**
-        object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
-        object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
-        object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
-        self.object_bbox_min = object_bbox_min[:3, 0]
-        self.object_bbox_max = object_bbox_max[:3, 0]
+        # Region of interest to **extract mesh**
+        self.object_bbox_min = np.float32([-1.01, -1.01, -1.01])
+        self.object_bbox_max = np.float32([ 1.01,  1.01,  1.01])
 
         print('Load data: End')
+
+    def get_image_and_mask(self, idx, resolution_level=1):
+        # Using nearest neighbors because it's not Mip-NeRF yet
+        def resize_and_convert(image, scale):
+            image = cv.resize(
+                image, dsize=None, fx=scale, fy=scale, interpolation=cv.INTER_NEAREST)
+            return torch.from_numpy(image.astype(np.float32) / 255.0)
+
+        scale = 1.0 / resolution_level
+        image = resize_and_convert(self.images[idx], scale)
+        mask = resize_and_convert(self.masks[idx], scale)[..., None]
+
+        return image, mask
 
     @staticmethod
     def gen_rays(pixels, pose, intrinsics_inv, H, W):
@@ -166,7 +172,9 @@ class Dataset:
             pixels, self.pose_all[img_idx, :3, :4],
             self.intrinsics_all_inv[img_idx, :3, :3], self.H, self.W)
 
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+        rgb, mask = self.get_image_and_mask(img_idx, resolution_level)
+
+        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), rgb.cuda(), mask.cuda()
 
     def gen_random_rays_at(self, img_idx, batch_size):
         """
@@ -174,15 +182,17 @@ class Dataset:
         """
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
-        color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
-        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+
+        rgb, mask = self.get_image_and_mask(img_idx)
+        rgb = rgb.cuda()[(pixels_y, pixels_x)]    # batch_size, 3
+        mask = mask.cuda()[(pixels_y, pixels_x)]  # batch_size, 1
 
         pixels = torch.stack([pixels_x, pixels_y], dim=-1).float()
         rays_o, rays_v = Dataset.gen_rays(
             pixels, self.pose_all[img_idx, :3, :4],
             self.intrinsics_all_inv[img_idx, :3, :3], self.H, self.W)
 
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o, rays_v, rgb, mask], dim=-1)  # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
@@ -196,8 +206,8 @@ class Dataset:
         p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
         trans = self.pose_all[idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[idx_1, :3, 3] * ratio
-        pose_0 = self.pose_all[idx_0].detach().cpu().numpy()
-        pose_1 = self.pose_all[idx_1].detach().cpu().numpy()
+        pose_0 = self.pose_all[idx_0].cpu().numpy()
+        pose_1 = self.pose_all[idx_1].cpu().numpy()
         pose_0 = np.linalg.inv(pose_0)
         pose_1 = np.linalg.inv(pose_1)
         rot_0 = pose_0[:3, :3]
@@ -224,8 +234,4 @@ class Dataset:
         near = mid - 1.0
         far = mid + 1.0
         return near, far
-
-    def image_at(self, idx, resolution_level):
-        img = cv.imread(self.images_lis[idx])
-        return (cv.resize(img, (self.W // resolution_level, self.H // resolution_level))).clip(0, 255)
 

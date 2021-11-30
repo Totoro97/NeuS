@@ -1,21 +1,29 @@
-import os
-import time
-import logging
-import argparse
+from models.dataset import Dataset
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
+from models.renderer import NeuSRenderer
+
+import cv2
 import numpy as np
 import cv2 as cv
 import trimesh
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from shutil import copyfile
 from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
-from models.renderer import NeuSRenderer
 
+import os
+import time
+import logging
+import argparse
+from shutil import copyfile
+
+
+def psnr(color_fine, true_rgb, mask):
+    assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
+    return 20.0 * torch.log10(
+        1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask.sum() * 3.0 + 1e-5)).sqrt())
 
 def load_config(conf_path, case='CASE_NAME'):
     with open(conf_path) as f:
@@ -44,6 +52,7 @@ class Runner:
         self.save_freq = self.conf.get_int('train.save_freq')
         self.report_freq = self.conf.get_int('train.report_freq')
         self.val_freq = self.conf.get_int('train.val_freq')
+        self.val_images_idxs = self.conf.get_list('train.val_images_idxs') # -1 for random
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
         self.batch_size = self.conf.get_int('train.batch_size')
         self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
@@ -135,7 +144,7 @@ class Runner:
             # Loss
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-            psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
+            psnr_train = psnr(color_fine, true_rgb, mask)
 
             eikonal_loss = gradient_error
 
@@ -149,33 +158,34 @@ class Runner:
             loss.backward()
             self.optimizer.step()
 
-            self.iter_step += 1
+            with torch.no_grad():
+                self.iter_step += 1
 
-            self.writer.add_scalar('Loss/loss', loss, self.iter_step)
-            self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
-            self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-            self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-            self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-            self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
+                self.writer.add_scalar('Loss/Total', loss, self.iter_step)
+                self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
+                self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
+                self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
+                self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+                self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+                self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
 
-            if self.iter_step % self.report_freq == 0:
-                print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                if self.iter_step % self.report_freq == 0:
+                    print(self.base_exp_dir)
+                    print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-            if self.iter_step % self.save_freq == 0:
-                self.save_checkpoint()
+                if self.iter_step % self.save_freq == 0:
+                    self.save_checkpoint()
 
-            if self.iter_step % self.val_freq == 0:
-                self.validate_image()
+                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
+                    self.validate_images(self.val_images_idxs)
 
-            if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                if self.iter_step % self.val_mesh_freq == 0:
+                    self.validate_mesh()
 
-            self.update_learning_rate()
+                self.update_learning_rate()
 
-            if self.iter_step % len(image_perm) == 0:
-                image_perm = self.get_image_perm()
+                if self.iter_step % len(image_perm) == 0:
+                    image_perm = self.get_image_perm()
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
@@ -234,72 +244,82 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
-    def validate_image(self, idx=-1, resolution_level=-1):
-        if idx < 0:
-            idx = np.random.randint(self.dataset.n_images)
+    def validate_images(self, idxs=[-1], resolution_level=-1):
+        idxs = [np.random.randint(self.dataset.n_images) if idx < 0 else idx for idx in idxs]
 
-        print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
+        print('Validate: iter: {}, cameras: {}'.format(self.iter_step, idxs))
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
-        rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
-        H, W, _ = rays_o.shape
-        rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
-        rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
 
-        out_rgb_fine = []
-        out_normal_fine = []
+        render_images = []
+        normal_images = []
+        psnr_val = []
 
-        for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
-            near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
-            background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+        for val_image_idx in tqdm(idxs):
+            rays_o, rays_d, true_rgb, mask = self.dataset.gen_rays_at(
+                val_image_idx, resolution_level=resolution_level)
 
-            render_out = self.renderer.render(rays_o_batch,
-                                              rays_d_batch,
-                                              near,
-                                              far,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                              background_rgb=background_rgb)
+            true_rgb = true_rgb.cpu()
+            mask = mask.cpu()
 
-            def feasible(key): return (key in render_out) and (render_out[key] is not None)
+            H, W, _ = rays_o.shape
+            rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
+            rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
 
-            if feasible('color_fine'):
-                out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
-            if feasible('gradients') and feasible('weights'):
-                n_samples = self.renderer.n_samples + self.renderer.n_importance
-                normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
-                if feasible('inside_sphere'):
-                    normals = normals * render_out['inside_sphere'][..., None]
-                normals = normals.sum(dim=1).detach().cpu().numpy()
-                out_normal_fine.append(normals)
-            del render_out
+            out_rgb_fine = []
+            out_normal_fine = []
 
-        img_fine = None
-        if len(out_rgb_fine) > 0:
-            img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
+                near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
+                background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
-        normal_img = None
-        if len(out_normal_fine) > 0:
-            normal_img = np.concatenate(out_normal_fine, axis=0)
-            rot = np.linalg.inv(self.dataset.pose_all[idx, :3, :3].detach().cpu().numpy())
-            normal_img = (np.matmul(rot[None, :, :], normal_img[:, :, None])
-                          .reshape([H, W, 3, -1]) * 128 + 128).clip(0, 255)
+                render_out = self.renderer.render(rays_o_batch,
+                                                  rays_d_batch,
+                                                  near,
+                                                  far,
+                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                                  background_rgb=background_rgb)
 
-        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
-        os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+                def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
-        for i in range(img_fine.shape[-1]):
-            if len(out_rgb_fine) > 0:
-                cv.imwrite(os.path.join(self.base_exp_dir,
-                                        'validations_fine',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                           np.concatenate([img_fine[..., i],
-                                           self.dataset.image_at(idx, resolution_level=resolution_level)]))
-            if len(out_normal_fine) > 0:
-                cv.imwrite(os.path.join(self.base_exp_dir,
-                                        'normals',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                           normal_img[..., i])
+                if feasible('color_fine'):
+                    out_rgb_fine.append(render_out['color_fine'].cpu())
+                if feasible('gradients') and feasible('weights'):
+                    n_samples = self.renderer.n_samples + self.renderer.n_importance
+                    normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
+                    if feasible('inside_sphere'):
+                        normals = normals * render_out['inside_sphere'][..., None]
+                    normals = normals.sum(dim=1).cpu()
+                    out_normal_fine.append(normals)
+                del render_out
+
+            img_fine = torch.cat(out_rgb_fine).reshape(H, W, 3).clamp(0.0, 1.0)
+
+            normal_img = torch.cat(out_normal_fine)
+            rot = torch.inverse(self.dataset.pose_all[val_image_idx, :3, :3].cpu())
+            normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
+            normal_img = normal_img.clamp(0.0, 1.0)
+
+            # os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+            # os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+
+            psnr_val.append(psnr(img_fine, true_rgb, mask))
+
+            render_image = torch.cat((img_fine, true_rgb), dim=1)
+            normal_image = normal_img
+
+            render_images.append(render_image)
+            normal_images.append(normal_image)
+
+        render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
+        normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)
+
+        self.writer.add_image(
+            'Image/Render (val)', render_images, self.iter_step, dataformats='HWC')
+        self.writer.add_image(
+            'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
+        self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
         """
@@ -326,7 +346,7 @@ class Runner:
 
             del render_out
 
-        img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
+        img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 255).clip(0, 255).astype(np.uint8)
         return img_fine
 
     def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
