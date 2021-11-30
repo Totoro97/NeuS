@@ -17,18 +17,22 @@ from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, N
 from models.renderer import NeuSRenderer
 
 
+def load_config(conf_path, case='CASE_NAME'):
+    with open(conf_path) as f:
+        conf_text = f.read()
+        conf_text = conf_text.replace('CASE_NAME', case)
+
+    return ConfigFactory.parse_string(conf_text)
+
+
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
         self.device = torch.device('cuda')
 
         # Configuration
         self.conf_path = conf_path
-        f = open(self.conf_path)
-        conf_text = f.read()
-        conf_text = conf_text.replace('CASE_NAME', case)
-        f.close()
+        self.conf = load_config(conf_path, case)
 
-        self.conf = ConfigFactory.parse_string(conf_text)
         self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
@@ -96,7 +100,7 @@ class Runner:
             self.file_backup()
 
     def train(self):
-        self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+        self.writer = SummaryWriter(log_dir=self.base_exp_dir)
         self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
@@ -343,9 +347,8 @@ class Runner:
 
     def interpolate_view(self, img_idx_0, img_idx_1):
         images = []
-        n_frames = 60
-        for i in range(n_frames):
-            print(i)
+        n_frames = 30
+        for i in tqdm(range(n_frames)):
             images.append(self.render_novel_image(img_idx_0,
                                                   img_idx_1,
                                                   np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5,
@@ -359,7 +362,7 @@ class Runner:
         h, w, _ = images[0].shape
         writer = cv.VideoWriter(os.path.join(video_dir,
                                              '{:0>8d}_{}_{}.mp4'.format(self.iter_step, img_idx_0, img_idx_1)),
-                                fourcc, 30, (w, h))
+                                fourcc, 15, (w, h))
 
         for image in images:
             writer.write(image)

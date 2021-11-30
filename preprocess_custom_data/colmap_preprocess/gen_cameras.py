@@ -5,9 +5,8 @@ import sys
 import os
 from glob import glob
 
-
-if __name__ == '__main__':
-    work_dir = sys.argv[1]
+def process_dir(dir_path, resave_images=True):
+    work_dir = dir_path
     poses_hwf = np.load(os.path.join(work_dir, 'poses.npy')) # n_images, 3, 5
     poses_raw = poses_hwf[:, :, :4]
     hwf = poses_hwf[:, :, 4]
@@ -45,9 +44,7 @@ if __name__ == '__main__':
         world_mat = intrinsic @ w2c
         world_mat = world_mat.astype(np.float32)
         cam_dict['camera_mat_{}'.format(i)] = intrinsic
-        cam_dict['camera_mat_inv_{}'.format(i)] = np.linalg.inv(intrinsic)
         cam_dict['world_mat_{}'.format(i)] = world_mat
-        cam_dict['world_mat_inv_{}'.format(i)] = np.linalg.inv(world_mat)
 
 
     pcd = trimesh.load(os.path.join(work_dir, 'sparse_points_interest.ply'))
@@ -61,20 +58,26 @@ if __name__ == '__main__':
 
     for i in range(n_images):
         cam_dict['scale_mat_{}'.format(i)] = scale_mat
-        cam_dict['scale_mat_inv_{}'.format(i)] = np.linalg.inv(scale_mat)
 
-    out_dir = os.path.join(work_dir, 'preprocessed')
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(os.path.join(out_dir, 'image'), exist_ok=True)
-    os.makedirs(os.path.join(out_dir, 'mask'), exist_ok=True)
+    if resave_images:
+        out_dir = os.path.join(work_dir, 'preprocessed')
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(os.path.join(out_dir, 'image'), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, 'mask'), exist_ok=True)
 
-    image_list = glob(os.path.join(work_dir, 'images/*.png'))
-    image_list.sort()
+        image_list = glob(os.path.join(work_dir, 'images/*.png'))
+        image_list.sort()
 
-    for i, image_path in enumerate(image_list):
-        img = cv.imread(image_path)
-        cv.imwrite(os.path.join(out_dir, 'image', '{:0>3d}.png'.format(i)), img)
-        cv.imwrite(os.path.join(out_dir, 'mask', '{:0>3d}.png'.format(i)), np.ones_like(img) * 255)
+        for i, image_path in enumerate(image_list):
+            img = cv.imread(image_path)
+            cv.imwrite(os.path.join(out_dir, 'image', '{:0>3d}.png'.format(i)), img)
+            cv.imwrite(os.path.join(out_dir, 'mask', '{:0>3d}.png'.format(i)), np.ones_like(img) * 255)
+    else:
+        out_dir = work_dir
 
     np.savez(os.path.join(out_dir, 'cameras_sphere.npz'), **cam_dict)
     print('Process done!')
+
+if __name__ == '__main__':
+    process_dir(sys.argv[1])
+
