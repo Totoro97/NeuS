@@ -176,7 +176,7 @@ class Runner:
                 if self.iter_step % self.save_freq == 0:
                     self.save_checkpoint()
 
-                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
+                if self.iter_step % self.val_freq == 0:
                     self.validate_images(self.val_images_idxs)
 
                 if self.iter_step % self.val_mesh_freq == 0:

@@ -1,0 +1,4 @@
+[submodule "preprocess_custom_data/gonzalo/Graphonomy"]
+	path = preprocess_custom_data/gonzalo/Graphonomy
+	url = https://github.com/shrubb/Graphonomy/
+	branch = voxceleb21
