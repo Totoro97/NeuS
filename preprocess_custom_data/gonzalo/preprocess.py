@@ -14,7 +14,7 @@ Preprocess videos from the "Gonzalo's dataset" for learning NeRF-like 3D portrai
 9.2. И ещё пишем загрузчик данных, который загружает данные только когда нужно и не переполняется (проверить, сколько надо памяти).
 10. Находим ~6 2D-лэндмарков на каждом кадре.
 11. Триангулируем. Запоминаем. Можно туда же, где и кроп.
-12. Находим преобразование (регистрируем) к референсной сцене. Важно это делать после near_far_from_sphere(). В коде это должно быть свойством именно "датасета Гонзало".
+12. Находим преобразование (регистрируем) к референсной сцене.
 """
 from get_similarity_transform import get_similarity_transform
 
@@ -254,6 +254,9 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper):
     (output_path / "dense/images").rename(undistorted_images_path)
     (output_path / "image").symlink_to(undistorted_images_path.name, target_is_directory=True)
 
+    # Detect faces and landmarks
+    logger.info(f"Detecting face and landmarks, visualizing at {images_preview_path}")
+
     human_data = {
         'crop_rectangles': [],
         'landmarks': [],
@@ -270,6 +273,11 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper):
 
         human_data['crop_rectangles'].append(crop_rectangle)
         human_data['landmarks'].append(landmarks)
+
+        l, t, r, b, _ = map(int, crop_rectangle)
+        cv2.rectangle(image, (l, t), (r, b), (0, 0, 255), 4)
+        cv2.imwrite(
+            str(images_preview_path / image_path.name), cv2.resize(image, None, fx=1/4, fy=1/4))
 
     # Save crop parameters and landmarks, just in case
     with open(output_path / "tabular_data.pkl", 'wb') as f:
@@ -317,6 +325,17 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper):
     # and then reuse 'scale_mat_XX' from the reference scene.
     resave_cameras_npz(camera_matrices, registration_transform, cameras_sphere_npz_path)
 
+    logger.info(f"Cleaning up")
+    # COLMAP-related
+    shutil.rmtree(output_path / "dense")
+    shutil.rmtree(output_path / "sparse")
+    (output_path / "database.db").unlink()
+    # NeuS' routine-related
+    (output_path / "poses.npy").unlink()
+    (output_path / "sparse_points_interest.ply").unlink()
+    # Everything else
+    shutil.rmtree(images_output_path) # non-undistorted images
+
 
 def get_timestamps_and_video(folder):
     files_in_dir = list(folder.iterdir())
@@ -349,13 +368,10 @@ def select_few_frames(
     # Determine which frames are with flash, remove them
     for flash_timestamp in flash_timestamps:
         flash_frame_idx = bisect.bisect(all_timestamps, flash_timestamp)
-        # Mark this and two neighboring frames as having flash
-        if flash_frame_idx > 0:
-            frames_to_keep[flash_frame_idx - 1] = False
-        if flash_frame_idx < len(all_timestamps):
-            frames_to_keep[flash_frame_idx] = False
-        if flash_frame_idx < len(all_timestamps) - 1:
-            frames_to_keep[flash_frame_idx + 1] = False
+        # Mark this and four neighboring frames as having flash
+        for frame_idx in range(flash_frame_idx - 2, flash_frame_idx + 2):
+            if 0 <= frame_idx < len(all_timestamps):
+                frames_to_keep[frame_idx] = False
 
     # Skip the first `first_n_frames_to_skip` (e.g. 40%)
     first_n_frames_to_skip = int(len(all_timestamps) * first_frames_fraction_to_skip)
