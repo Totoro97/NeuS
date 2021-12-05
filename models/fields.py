@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from models.embedder import get_embedder
 
+import logging
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
@@ -41,6 +42,8 @@ class SDFNetwork(nn.Module):
         self.skip_in = skip_in
         self.scale = scale
 
+        total_scene_specific_layers = 0
+
         for l in range(0, self.num_layers - 1):
             if l + 1 in self.skip_in:
                 out_dim = dims[l + 1] - dims[0]
@@ -75,12 +78,17 @@ class SDFNetwork(nn.Module):
 
                 return lin
 
-            if l % 2 == 0:
-                lin = create_linear_layer()
-            else:
+            if l % 2 == 1 and dims[l] == out_dim:
                 lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
+                total_scene_specific_layers += 1
+            else:
+                lin = create_linear_layer()
 
             setattr(self, "lin" + str(l), lin)
+
+        logging.info(
+            f"SDF network got {total_scene_specific_layers} (out of " \
+            f"{self.num_layers - 1}) scene-specific layers")
 
         self.activation = nn.Softplus(beta=100)
 
@@ -92,16 +100,23 @@ class SDFNetwork(nn.Module):
         x = inputs
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
-            if type(lin) is torch.nn.ModuleList:
+            layer_is_scene_specific = type(lin) is torch.nn.ModuleList
+
+            if layer_is_scene_specific:
                 lin = lin[scene_idx]
+                skip_connection = x
 
             if l in self.skip_in:
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
 
             x = lin(x)
 
+            if layer_is_scene_specific:
+                x += skip_connection
+
             if l < self.num_layers - 2:
                 x = self.activation(x)
+
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
     def sdf(self, x, scene_idx):
@@ -149,6 +164,8 @@ class RenderingNetwork(nn.Module):
 
         self.num_layers = len(dims)
 
+        total_scene_specific_layers = 0
+
         for l in range(0, self.num_layers - 1):
             out_dim = dims[l + 1]
 
@@ -160,12 +177,17 @@ class RenderingNetwork(nn.Module):
 
                 return lin
 
-            if l % 2 == 0:
-                lin = create_linear_layer()
-            else:
+            if l % 2 == 1 and dims[l] == out_dim:
                 lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
+                total_scene_specific_layers += 1
+            else:
+                lin = create_linear_layer()
 
             setattr(self, "lin" + str(l), lin)
+
+        logging.info(
+            f"Rendering network got {total_scene_specific_layers} (out of " \
+            f"{self.num_layers - 1}) scene-specific layers")
 
         self.relu = nn.ReLU()
 
@@ -186,10 +208,16 @@ class RenderingNetwork(nn.Module):
 
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
-            if type(lin) is torch.nn.ModuleList:
+            layer_is_scene_specific = type(lin) is torch.nn.ModuleList
+
+            if layer_is_scene_specific:
                 lin = lin[scene_idx]
+                skip_connection = x
 
             x = lin(x)
+
+            if layer_is_scene_specific:
+                x += skip_connection
 
             if l < self.num_layers - 2:
                 x = self.relu(x)
