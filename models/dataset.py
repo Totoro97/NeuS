@@ -71,8 +71,6 @@ class Dataset:
         # Retrieve config values
         self.data_dirs = conf.get_list('data_dirs')
         self.num_scenes = len(self.data_dirs)
-        if self.num_scenes > 1:
-            raise NotImplementedError("NYI: multiple scenes")
 
         render_cameras_name = conf.get_string('render_cameras_name')
 

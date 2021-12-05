@@ -174,7 +174,7 @@ class NeuSRenderer:
         z_samples = sample_pdf(z_vals, weights, n_importance, det=True).detach()
         return z_samples
 
-    def cat_z_vals(self, rays_o, rays_d, z_vals, new_z_vals, sdf, last=False):
+    def cat_z_vals(self, rays_o, rays_d, z_vals, new_z_vals, sdf, scene_idx, last=False):
         batch_size, n_samples = z_vals.shape
         _, n_importance = new_z_vals.shape
         pts = rays_o[:, None, :] + rays_d[:, None, :] * new_z_vals[..., :, None]
@@ -182,7 +182,7 @@ class NeuSRenderer:
         z_vals, index = torch.sort(z_vals, dim=-1)
 
         if not last:
-            new_sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, n_importance)
+            new_sdf = self.sdf_network.sdf(pts.reshape(-1, 3), scene_idx).reshape(batch_size, n_importance)
             sdf = torch.cat([sdf, new_sdf], dim=-1)
             xx = torch.arange(batch_size)[:, None].expand(batch_size, n_samples + n_importance).reshape(-1)
             index = index.reshape(-1)
@@ -195,6 +195,7 @@ class NeuSRenderer:
                     rays_d,
                     z_vals,
                     sample_dist,
+                    scene_idx,
                     sdf_network,
                     deviation_network,
                     color_network,
@@ -216,12 +217,12 @@ class NeuSRenderer:
         pts = pts.reshape(-1, 3)
         dirs = dirs.reshape(-1, 3)
 
-        sdf_nn_output = sdf_network(pts)
+        sdf_nn_output = sdf_network(pts, scene_idx)
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
-        gradients = sdf_network.gradient(pts).squeeze()
-        sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
+        gradients = sdf_network.gradient(pts, scene_idx).squeeze()
+        sampled_color = color_network(pts, gradients, dirs, feature_vector, scene_idx).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
@@ -282,7 +283,10 @@ class NeuSRenderer:
             'inside_sphere': inside_sphere
         }
 
-    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+    def render(self,
+        rays_o, rays_d, near, far, scene_idx,
+        perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
         z_vals = torch.linspace(0.0, 1.0, self.n_samples)
@@ -318,7 +322,7 @@ class NeuSRenderer:
         if self.n_importance > 0:
             with torch.no_grad():
                 pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
+                sdf = self.sdf_network.sdf(pts.reshape(-1, 3), scene_idx).reshape(batch_size, self.n_samples)
 
                 for i in range(self.up_sample_steps):
                     new_z_vals = self.up_sample(rays_o,
@@ -332,6 +336,7 @@ class NeuSRenderer:
                                                   z_vals,
                                                   new_z_vals,
                                                   sdf,
+                                                  scene_idx,
                                                   last=(i + 1 == self.up_sample_steps))
 
             n_samples = self.n_samples + self.n_importance
@@ -340,7 +345,8 @@ class NeuSRenderer:
         if self.n_outside > 0:
             z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
             z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
+            ret_outside = self.render_core_outside(
+                rays_o, rays_d, z_vals_feed, sample_dist, self.nerf[scene_idx])
 
             background_sampled_color = ret_outside['sampled_color']
             background_alpha = ret_outside['alpha']
@@ -350,6 +356,7 @@ class NeuSRenderer:
                                     rays_d,
                                     z_vals,
                                     sample_dist,
+                                    scene_idx,
                                     self.sdf_network,
                                     self.deviation_network,
                                     self.color_network,

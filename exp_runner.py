@@ -75,10 +75,10 @@ class Runner:
 
         # Networks
         params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+        self.nerf_outside = torch.nn.ModuleList([NeRF(**self.conf['model.nerf']).to(self.device) for _ in range(self.dataset.num_scenes)])
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=self.dataset.num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
-        self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
+        self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=self.dataset.num_scenes).to(self.device)
         params_to_train += list(self.nerf_outside.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
@@ -141,7 +141,7 @@ class Runner:
                 mask = torch.ones_like(mask)
 
             mask_sum = mask.sum() + 1e-5
-            render_out = self.renderer.render(rays_o, rays_d, near, far,
+            render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
                                               background_rgb=background_rgb,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio())
 
@@ -187,7 +187,7 @@ class Runner:
                 if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                     self.save_checkpoint()
 
-                if self.iter_step % self.val_freq == 0:
+                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
                     self.validate_images(self.val_images_idxs)
 
                 if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
@@ -197,10 +197,9 @@ class Runner:
 
     def get_dataset_indices(self):
         # Generate all possible pairs (scene_idx, image_idx)
-        num_scenes = len(self.dataset.images)
         num_images = list(map(len, self.dataset.images))
         all_data_idxs = [(scene_idx, image_idx) \
-            for scene_idx in range(num_scenes) \
+            for scene_idx in range(self.dataset.num_scenes) \
             for image_idx in range(num_images[scene_idx])]
 
         return all_data_idxs
@@ -302,6 +301,7 @@ class Runner:
                                                   rays_d_batch,
                                                   near,
                                                   far,
+                                                  val_scene_idx,
                                                   cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                                   background_rgb=background_rgb)
 
@@ -364,6 +364,7 @@ class Runner:
                                               rays_d_batch,
                                               near,
                                               far,
+                                              scene_idx,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb)
 

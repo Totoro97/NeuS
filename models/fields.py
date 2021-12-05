@@ -12,6 +12,7 @@ class SDFNetwork(nn.Module):
                  d_out,
                  d_hidden,
                  n_layers,
+                 n_scenes,
                  skip_in=(4,),
                  multires=0,
                  bias=0.5,
@@ -19,7 +20,13 @@ class SDFNetwork(nn.Module):
                  geometric_init=True,
                  weight_norm=True,
                  inside_outside=False):
-        super(SDFNetwork, self).__init__()
+        """
+        n_scenes
+            int
+            Spawn `n_scenes` copies of every other layer, each trained independently. During the
+            forward pass, take a scene index `i` and use the `i`th copy at each such layer.
+        """
+        super().__init__()
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
@@ -40,36 +47,44 @@ class SDFNetwork(nn.Module):
             else:
                 out_dim = dims[l + 1]
 
-            lin = nn.Linear(dims[l], out_dim)
+            def create_linear_layer():
+                lin = nn.Linear(dims[l], out_dim)
 
-            if geometric_init:
-                if l == self.num_layers - 2:
-                    if not inside_outside:
-                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, -bias)
+                if geometric_init:
+                    if l == self.num_layers - 2:
+                        if not inside_outside:
+                            torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                            torch.nn.init.constant_(lin.bias, -bias)
+                        else:
+                            torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                            torch.nn.init.constant_(lin.bias, bias)
+                    elif multires > 0 and l == 0:
+                        torch.nn.init.constant_(lin.bias, 0.0)
+                        torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
+                        torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    elif multires > 0 and l in self.skip_in:
+                        torch.nn.init.constant_(lin.bias, 0.0)
+                        torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                        torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
                     else:
-                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, bias)
-                elif multires > 0 and l == 0:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
-                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                elif multires > 0 and l in self.skip_in:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
-                else:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                        torch.nn.init.constant_(lin.bias, 0.0)
+                        torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
-            if weight_norm:
-                lin = nn.utils.weight_norm(lin)
+                if weight_norm:
+                    lin = nn.utils.weight_norm(lin)
+
+                return lin
+
+            if l % 2 == 0:
+                lin = create_linear_layer()
+            else:
+                lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
 
             setattr(self, "lin" + str(l), lin)
 
         self.activation = nn.Softplus(beta=100)
 
-    def forward(self, inputs):
+    def forward(self, inputs, scene_idx):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
             inputs = self.embed_fn_fine(inputs)
@@ -77,6 +92,8 @@ class SDFNetwork(nn.Module):
         x = inputs
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
+            if type(lin) is torch.nn.ModuleList:
+                lin = lin[scene_idx]
 
             if l in self.skip_in:
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
@@ -87,16 +104,13 @@ class SDFNetwork(nn.Module):
                 x = self.activation(x)
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
-    def sdf(self, x):
-        return self.forward(x)[:, :1]
+    def sdf(self, x, scene_idx):
+        return self(x, scene_idx)[:, :1]
 
-    def sdf_hidden_appearance(self, x):
-        return self.forward(x)
-
-    def gradient(self, x):
+    def gradient(self, x, scene_idx):
         with torch.enable_grad():
             x.requires_grad_(True)
-            y = self.sdf(x)
+            y = self.sdf(x, scene_idx)
             d_output = torch.ones_like(y, requires_grad=False, device=y.device)
             gradients = torch.autograd.grad(
                 outputs=y,
@@ -117,6 +131,7 @@ class RenderingNetwork(nn.Module):
                  d_out,
                  d_hidden,
                  n_layers,
+                 n_scenes,
                  weight_norm=True,
                  multires_view=0,
                  squeeze_out=True):
@@ -136,16 +151,25 @@ class RenderingNetwork(nn.Module):
 
         for l in range(0, self.num_layers - 1):
             out_dim = dims[l + 1]
-            lin = nn.Linear(dims[l], out_dim)
 
-            if weight_norm:
-                lin = nn.utils.weight_norm(lin)
+            def create_linear_layer():
+                lin = nn.Linear(dims[l], out_dim)
+
+                if weight_norm:
+                    lin = nn.utils.weight_norm(lin)
+
+                return lin
+
+            if l % 2 == 0:
+                lin = create_linear_layer()
+            else:
+                lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
 
             setattr(self, "lin" + str(l), lin)
 
         self.relu = nn.ReLU()
 
-    def forward(self, points, normals, view_dirs, feature_vectors):
+    def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
 
@@ -162,6 +186,8 @@ class RenderingNetwork(nn.Module):
 
         for l in range(0, self.num_layers - 1):
             lin = getattr(self, "lin" + str(l))
+            if type(lin) is torch.nn.ModuleList:
+                lin = lin[scene_idx]
 
             x = lin(x)
 
