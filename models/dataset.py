@@ -4,10 +4,9 @@ import cv2 as cv
 import numpy as np
 import os
 from glob import glob
-from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
-
+from tqdm import tqdm
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
 def load_K_Rt_from_P(filename, P=None):
@@ -70,36 +69,46 @@ class Dataset:
         self.conf = conf
 
         # Retrieve config values
-        self.data_dir = conf.get_string('data_dir')
-        self.render_cameras_name = conf.get_string('render_cameras_name')
-        self.object_cameras_name = conf.get_string('object_cameras_name')
+        self.data_dirs = conf.get_list('data_dirs')
+        self.num_scenes = len(self.data_dirs)
+        if self.num_scenes > 1:
+            raise NotImplementedError("NYI: multiple scenes")
 
-        self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
-        self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
+        render_cameras_name = conf.get_string('render_cameras_name')
 
-        # Load images
-        images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
-        self.n_images = len(images_lis)
-        # [n_images, H, W, 3], uint8
-        self.images = np.stack([cv.imread(im_name) for im_name in images_lis])
-        masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
-        # [n_images, H, W, 1], uint8
-        self.masks = np.stack([cv.imread(im_name)[..., 0] for im_name in masks_lis])
+        def load_one_scene(root_dir):
+            # Load images
+            images_lis = sorted(glob(os.path.join(root_dir, 'image/*.png')))
+            n_images = len(images_lis)
+            # [n_images, H, W, 3], uint8
+            images = np.stack([cv.imread(im_name) for im_name in images_lis])
+            masks_lis = sorted(glob(os.path.join(root_dir, 'mask/*.png')))
+            # [n_images, H, W, 1], uint8
+            masks = np.stack([cv.imread(im_name)[..., 0] for im_name in masks_lis])
 
-        # Load camera parameters
-        self.pose_all, self.intrinsics_all, self.scale_mats_np, self.focal = \
-            load_camera_matrices(os.path.join(self.data_dir, self.render_cameras_name))
+            # Load camera parameters
+            pose_all, intrinsics_all, scale_mats_np, focal = \
+                load_camera_matrices(os.path.join(root_dir, render_cameras_name))
 
-        assert len(self.pose_all) == self.n_images
-        assert len(self.intrinsics_all) == self.n_images
-        assert len(self.scale_mats_np) == self.n_images
+            assert len(pose_all) == n_images
+            assert len(intrinsics_all) == n_images
+            assert len(scale_mats_np) == n_images
 
-        self.pose_all = self.pose_all.to(self.device)
-        self.intrinsics_all = self.intrinsics_all.to(self.device)
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
+            return images, masks, pose_all, intrinsics_all, scale_mats_np, focal
 
-        self.H, self.W = self.images.shape[1], self.images.shape[2]
+        all_data = [load_one_scene(data_dir) for data_dir in tqdm(self.data_dirs)]
+        # Transpose
+        self.images, self.masks, self.pose_all, self.intrinsics_all, _, self.focal = \
+            list(zip(*all_data))
+
+        self.pose_all = [x.to(self.device) for x in self.pose_all]
+        self.intrinsics_all = [x.to(self.device) for x in self.intrinsics_all]
+        self.intrinsics_all_inv = [torch.inverse(x) for x in self.intrinsics_all]
+
+        self.H, self.W = self.images[0].shape[1:3]
         self.image_pixels = self.H * self.W
+        if not all(images.shape[1:3] == (self.H, self.W) for images in self.images):
+            raise NotImplementedError("Images of different sizes not supported yet")
 
         # Region of interest to **extract mesh**
         self.object_bbox_min = np.float32([-1.01, -1.01, -1.01])
@@ -107,7 +116,7 @@ class Dataset:
 
         print('Load data: End')
 
-    def get_image_and_mask(self, idx, resolution_level=1):
+    def get_image_and_mask(self, scene_idx, image_idx, resolution_level=1):
         # Using nearest neighbors because it's not Mip-NeRF yet
         def resize_and_convert(image, scale):
             image = cv.resize(
@@ -115,8 +124,8 @@ class Dataset:
             return torch.from_numpy(image.astype(np.float32) / 255.0)
 
         scale = 1.0 / resolution_level
-        image = resize_and_convert(self.images[idx], scale)
-        mask = resize_and_convert(self.masks[idx], scale)[..., None]
+        image = resize_and_convert(self.images[scene_idx][image_idx], scale)
+        mask = resize_and_convert(self.masks[scene_idx][image_idx], scale)[..., None]
 
         return image, mask
 
@@ -159,7 +168,7 @@ class Dataset:
 
         return rays_o, rays_v
 
-    def gen_rays_at(self, img_idx, resolution_level=1):
+    def gen_rays_at(self, scene_idx, image_idx, resolution_level=1):
         """
         Generate rays at world space from one camera.
         """
@@ -169,32 +178,32 @@ class Dataset:
         pixels = torch.stack(torch.meshgrid(tx, ty), dim=-1)
 
         rays_o, rays_v = Dataset.gen_rays(
-            pixels, self.pose_all[img_idx, :3, :4],
-            self.intrinsics_all_inv[img_idx, :3, :3], self.H, self.W)
+            pixels, self.pose_all[scene_idx][image_idx, :3, :4],
+            self.intrinsics_all_inv[scene_idx][image_idx, :3, :3], self.H, self.W)
 
-        rgb, mask = self.get_image_and_mask(img_idx, resolution_level)
+        rgb, mask = self.get_image_and_mask(scene_idx, image_idx, resolution_level)
 
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1), rgb.cuda(), mask.cuda()
 
-    def gen_random_rays_at(self, img_idx, batch_size):
+    def gen_random_rays_at(self, scene_idx, image_idx, batch_size):
         """
         Generate random rays at world space from one camera.
         """
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
 
-        rgb, mask = self.get_image_and_mask(img_idx)
+        rgb, mask = self.get_image_and_mask(scene_idx, image_idx)
         rgb = rgb.cuda()[(pixels_y, pixels_x)]    # batch_size, 3
         mask = mask.cuda()[(pixels_y, pixels_x)]  # batch_size, 1
 
         pixels = torch.stack([pixels_x, pixels_y], dim=-1).float()
         rays_o, rays_v = Dataset.gen_rays(
-            pixels, self.pose_all[img_idx, :3, :4],
-            self.intrinsics_all_inv[img_idx, :3, :3], self.H, self.W)
+            pixels, self.pose_all[scene_idx][image_idx, :3, :4],
+            self.intrinsics_all_inv[scene_idx][image_idx, :3, :3], self.H, self.W)
 
         return torch.cat([rays_o, rays_v, rgb, mask], dim=-1)  # batch_size, 10
 
-    def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
+    def gen_rays_between(self, scene_idx, image_idx_0, image_idx_1, ratio, resolution_level=1):
         """
         Interpolate pose between two cameras.
         """
@@ -203,11 +212,11 @@ class Dataset:
         ty = torch.linspace(0, self.H - 1, self.H // l)
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
+        p = torch.matmul(self.intrinsics_all_inv[scene_idx][0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
-        trans = self.pose_all[idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[idx_1, :3, 3] * ratio
-        pose_0 = self.pose_all[idx_0].cpu().numpy()
-        pose_1 = self.pose_all[idx_1].cpu().numpy()
+        trans = self.pose_all[scene_idx][image_idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[scene_idx][idx_1, :3, 3] * ratio
+        pose_0 = self.pose_all[scene_idx][image_idx_0].cpu().numpy()
+        pose_1 = self.pose_all[scene_idx][image_idx_1].cpu().numpy()
         pose_0 = np.linalg.inv(pose_0)
         pose_1 = np.linalg.inv(pose_1)
         rot_0 = pose_0[:3, :3]

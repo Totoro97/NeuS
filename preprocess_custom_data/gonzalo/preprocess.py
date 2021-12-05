@@ -366,12 +366,22 @@ def select_few_frames(
     frames_to_keep = [True] * len(all_timestamps)
 
     # Determine which frames are with flash, remove them
+
+    # `flash_timestamps` tell when the flash is triggered (in nanoseconds).
+    # The manually measured rough conservative values below tell what can be the delay between
+    # the trigger and the start/stop of the flashlight.
+    FLASH_MIN_START_DELAY = 190_000_000
+    FLASH_MAX_END_DELAY = 420_000_000
+
     for flash_timestamp in flash_timestamps:
-        flash_frame_idx = bisect.bisect(all_timestamps, flash_timestamp)
-        # Mark this and four neighboring frames as having flash
-        for frame_idx in range(flash_frame_idx - 2, flash_frame_idx + 2):
-            if 0 <= frame_idx < len(all_timestamps):
-                frames_to_keep[frame_idx] = False
+        flash_first_frame_idx = bisect.bisect(
+            all_timestamps, flash_timestamp + FLASH_MIN_START_DELAY)
+        flash_last_frame_idx = bisect.bisect(
+            all_timestamps, flash_timestamp + FLASH_MAX_END_DELAY)
+
+        # Mark these frames as having flash
+        for frame_idx in range(flash_first_frame_idx, flash_last_frame_idx):
+            frames_to_keep[frame_idx] = False
 
     # Skip the first `first_n_frames_to_skip` (e.g. 40%)
     first_n_frames_to_skip = int(len(all_timestamps) * first_frames_fraction_to_skip)

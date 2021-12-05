@@ -13,6 +13,8 @@ from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 
+import random
+import pathlib
 import os
 import time
 import logging
@@ -25,34 +27,33 @@ def psnr(color_fine, true_rgb, mask):
     return 20.0 * torch.log10(
         1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask.sum() * 3.0 + 1e-5)).sqrt())
 
-def load_config(conf_path, case='CASE_NAME'):
+def load_config(conf_path):
     with open(conf_path) as f:
-        conf_text = f.read()
-        conf_text = conf_text.replace('CASE_NAME', case)
-
-    return ConfigFactory.parse_string(conf_text)
+        return ConfigFactory.parse_string(f.read())
 
 
 class Runner:
-    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
+    def __init__(self, conf_path, mode='train'):
         self.device = torch.device('cuda')
 
         # Configuration
         self.conf_path = conf_path
-        self.conf = load_config(conf_path, case)
+        self.conf = load_config(conf_path)
 
-        self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
-        self.iter_step = 0
+
+        logging.info(f"Experiment dir: {self.base_exp_dir}")
 
         # Training parameters
         self.end_iter = self.conf.get_int('train.end_iter')
         self.save_freq = self.conf.get_int('train.save_freq')
         self.report_freq = self.conf.get_int('train.report_freq')
         self.val_freq = self.conf.get_int('train.val_freq')
-        self.val_images_idxs = self.conf.get_list('train.val_images_idxs') # -1 for random
+        # List of (scene_idx, image_idx) pairs. Example: [[0, 4], [1, 2]].
+        # -1 for random. Examples: [-1] or [[0, 4], -1]
+        self.val_images_idxs = self.conf.get_list('train.val_images_idxs')
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
         self.batch_size = self.conf.get_int('train.batch_size')
         self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
@@ -61,11 +62,13 @@ class Runner:
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
+        self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
+        self.iter_step = None if self.restart_from_iter is None else self.restart_from_iter
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
-        self.is_continue = is_continue
+        self.checkpoint_path = self.conf.get_string('train.checkpoint_path', default=None)
         self.mode = mode
         self.model_list = []
         self.writer = None
@@ -89,20 +92,23 @@ class Runner:
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
 
-        # Load checkpoint
-        latest_model_name = None
-        if is_continue:
-            model_list_raw = os.listdir(os.path.join(self.base_exp_dir, 'checkpoints'))
-            model_list = []
-            for model_name in model_list_raw:
-                if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
-                    model_list.append(model_name)
-            model_list.sort()
-            latest_model_name = model_list[-1]
+        # Try to find the latest checkpoint
+        if self.checkpoint_path is None:
+            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
+            if checkpoints_dir.is_dir():
+                checkpoints = sorted(checkpoints_dir.iterdir())
+            else:
+                checkpoints = []
 
-        if latest_model_name is not None:
-            logging.info('Find checkpoint: {}'.format(latest_model_name))
-            self.load_checkpoint(latest_model_name)
+            if checkpoints:
+                self.checkpoint_path = checkpoints[-1]
+
+        # Load checkpoint
+        if self.checkpoint_path is None:
+            self.iter_step = self.iter_step or 0
+        else:
+            logging.info(f"Loading from checkpoint {self.checkpoint_path}")
+            self.load_checkpoint(self.checkpoint_path)
 
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
@@ -112,10 +118,15 @@ class Runner:
         self.writer = SummaryWriter(log_dir=self.base_exp_dir)
         self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
-        image_perm = self.get_image_perm()
+        data_idxs = self.get_dataset_indices()
 
         for iter_i in tqdm(range(res_step)):
-            data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+            # Shuffle every so often
+            if self.iter_step % len(data_idxs) == 0:
+                random.shuffle(data_idxs)
+
+            scene_idx, image_idx = data_idxs[self.iter_step % len(data_idxs)]
+            data = self.dataset.gen_random_rays_at(scene_idx, image_idx, self.batch_size)
 
             rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
@@ -173,22 +184,26 @@ class Runner:
                     print(self.base_exp_dir)
                     print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-                if self.iter_step % self.save_freq == 0:
+                if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                     self.save_checkpoint()
 
                 if self.iter_step % self.val_freq == 0:
                     self.validate_images(self.val_images_idxs)
 
-                if self.iter_step % self.val_mesh_freq == 0:
+                if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                     self.validate_mesh()
 
                 self.update_learning_rate()
 
-                if self.iter_step % len(image_perm) == 0:
-                    image_perm = self.get_image_perm()
+    def get_dataset_indices(self):
+        # Generate all possible pairs (scene_idx, image_idx)
+        num_scenes = len(self.dataset.images)
+        num_images = list(map(len, self.dataset.images))
+        all_data_idxs = [(scene_idx, image_idx) \
+            for scene_idx in range(num_scenes) \
+            for image_idx in range(num_images[scene_idx])]
 
-    def get_image_perm(self):
-        return torch.randperm(self.dataset.n_images)
+        return all_data_idxs
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end == 0.0:
@@ -220,14 +235,15 @@ class Runner:
 
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
-    def load_checkpoint(self, checkpoint_name):
-        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
+    def load_checkpoint(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.nerf_outside.load_state_dict(checkpoint['nerf'])
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.iter_step = checkpoint['iter_step']
+        if self.iter_step is None:
+            self.iter_step = checkpoint['iter_step']
 
         logging.info('End')
 
@@ -245,9 +261,17 @@ class Runner:
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
     def validate_images(self, idxs=[-1], resolution_level=-1):
-        idxs = [np.random.randint(self.dataset.n_images) if idx < 0 else idx for idx in idxs]
+        def get_random_dataset_idx():
+            scene_idx = random.randint(0, self.dataset.num_scenes - 1)
+            image_idx = random.randint(0, len(self.dataset.images[scene_idx]) - 1)
+            return scene_idx, image_idx
 
-        print('Validate: iter: {}, cameras: {}'.format(self.iter_step, idxs))
+        # Treat a plain integer as a camera index in the scene #0
+        idxs = [(0, idx) if type(idx) is int else idx for idx in idxs]
+        # Treat -1s as "pick a random dataset camera"
+        idxs = [get_random_dataset_idx() if idx[0] < 0 else idx for idx in idxs]
+
+        print('Validate: iter: {}, (scene, camera): {}'.format(self.iter_step, idxs))
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
@@ -256,9 +280,9 @@ class Runner:
         normal_images = []
         psnr_val = []
 
-        for val_image_idx in tqdm(idxs):
+        for val_scene_idx, val_image_idx in tqdm(idxs):
             rays_o, rays_d, true_rgb, mask = self.dataset.gen_rays_at(
-                val_image_idx, resolution_level=resolution_level)
+                val_scene_idx, val_image_idx, resolution_level=resolution_level)
 
             true_rgb = true_rgb.cpu()
             mask = mask.cpu()
@@ -297,7 +321,7 @@ class Runner:
             img_fine = torch.cat(out_rgb_fine).reshape(H, W, 3).clamp(0.0, 1.0)
 
             normal_img = torch.cat(out_normal_fine)
-            rot = torch.inverse(self.dataset.pose_all[val_image_idx, :3, :3].cpu())
+            rot = torch.inverse(self.dataset.pose_all[val_scene_idx][val_image_idx, :3, :3].cpu())
             normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
             normal_img = normal_img.clamp(0.0, 1.0)
 
@@ -321,11 +345,12 @@ class Runner:
             'Image/Normals (val)', normal_images, self.iter_step, dataformats='HWC')
         self.writer.add_scalar('Loss/PSNR (val)', np.mean(psnr_val), self.iter_step)
 
-    def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
+    def render_novel_image(self, scene_idx, idx_0, idx_1, ratio, resolution_level):
         """
         Interpolate view between two cameras.
         """
-        rays_o, rays_d = self.dataset.gen_rays_between(idx_0, idx_1, ratio, resolution_level=resolution_level)
+        rays_o, rays_d = self.dataset.gen_rays_between(
+            scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
@@ -369,10 +394,9 @@ class Runner:
         images = []
         n_frames = 30
         for i in tqdm(range(n_frames)):
-            images.append(self.render_novel_image(img_idx_0,
-                                                  img_idx_1,
-                                                  np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5,
-                          resolution_level=4))
+            images.append(self.render_novel_image(
+                0, img_idx_0, img_idx_1,
+                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=4))
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
 
@@ -402,14 +426,12 @@ if __name__ == '__main__':
     parser.add_argument('--conf', type=str, default='./confs/base.conf')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
-    parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--case', type=str, default='')
 
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    runner = Runner(args.conf, args.mode)
 
     if args.mode == 'train':
         runner.train()
