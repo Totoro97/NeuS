@@ -383,9 +383,9 @@ class NeuSRenderer:
             'inside_sphere': ret_fine['inside_sphere']
         }
 
-    def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
+    def extract_geometry(self, scene_idx, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,
                                 bound_max,
                                 resolution=resolution,
                                 threshold=threshold,
-                                query_func=lambda pts: -self.sdf_network.sdf(pts))
+                                query_func=lambda pts: -self.sdf_network.sdf(pts, scene_idx))

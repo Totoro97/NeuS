@@ -375,12 +375,12 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 255).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
+    def validate_mesh(self, scene_idx=0, world_space=False, resolution=64, threshold=0.0):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
-        vertices, triangles =\
-            self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
+        vertices, triangles =self.renderer.extract_geometry(
+            scene_idx, bound_min, bound_max, resolution=resolution, threshold=threshold)
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 
         if world_space:
@@ -391,12 +391,12 @@ class Runner:
 
         logging.info('End')
 
-    def interpolate_view(self, img_idx_0, img_idx_1):
+    def interpolate_view(self, scene_idx, img_idx_0, img_idx_1):
         images = []
         n_frames = 30
         for i in tqdm(range(n_frames)):
             images.append(self.render_novel_image(
-                0, img_idx_0, img_idx_1,
+                scene_idx, img_idx_0, img_idx_1,
                 np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=4))
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
@@ -438,8 +438,14 @@ if __name__ == '__main__':
         runner.train()
     elif args.mode == 'validate_mesh':
         runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
-    elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
-        _, img_idx_0, img_idx_1 = args.mode.split('_')
-        img_idx_0 = int(img_idx_0)
-        img_idx_1 = int(img_idx_1)
-        runner.interpolate_view(img_idx_0, img_idx_1)
+    elif args.mode.startswith('interpolate_'):
+        # Interpolate views given [optional: scene index and] two image indices
+        arguments = args.mode.split('_')[1:]
+        if len(arguments) == 3:
+            img_idx_0, img_idx_1 = map(int, arguments)
+        elif len(arguments) == 4:
+            scene_idx, img_idx_0, img_idx_1 = map(int, arguments)
+        else:
+            raise ValueError(f"Wrong number of '_' arguments (must be 3 or 4): {args.mode}")
+
+        runner.interpolate_view(scene_idx, img_idx_0, img_idx_1)
