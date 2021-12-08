@@ -212,7 +212,7 @@ class Dataset:
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
         p = torch.matmul(self.intrinsics_all_inv[scene_idx][0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
-        trans = self.pose_all[scene_idx][image_idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[scene_idx][idx_1, :3, 3] * ratio
+        trans = self.pose_all[scene_idx][image_idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[scene_idx][image_idx_1, :3, 3] * ratio
         pose_0 = self.pose_all[scene_idx][image_idx_0].cpu().numpy()
         pose_1 = self.pose_all[scene_idx][image_idx_1].cpu().numpy()
         pose_0 = np.linalg.inv(pose_0)

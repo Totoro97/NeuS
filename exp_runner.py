@@ -405,9 +405,11 @@ class Runner:
         video_dir = os.path.join(self.base_exp_dir, 'render')
         os.makedirs(video_dir, exist_ok=True)
         h, w, _ = images[0].shape
-        writer = cv.VideoWriter(os.path.join(video_dir,
-                                             '{:0>8d}_{}_{}.mp4'.format(self.iter_step, img_idx_0, img_idx_1)),
-                                fourcc, 15, (w, h))
+        writer = cv.VideoWriter(
+            os.path.join(
+                video_dir,
+                f"{self.iter_step:0>8d}_scene{scene_idx:03d}_{img_idx_0}_{img_idx_1}.mp4"),
+            fourcc, 15, (w, h))
 
         for image in images:
             writer.write(image)
@@ -441,9 +443,9 @@ if __name__ == '__main__':
     elif args.mode.startswith('interpolate_'):
         # Interpolate views given [optional: scene index and] two image indices
         arguments = args.mode.split('_')[1:]
-        if len(arguments) == 3:
-            img_idx_0, img_idx_1 = map(int, arguments)
-        elif len(arguments) == 4:
+        if len(arguments) == 2:
+            scene_idx, (img_idx_0, img_idx_1) = 0, map(int, arguments)
+        elif len(arguments) == 3:
             scene_idx, img_idx_0, img_idx_1 = map(int, arguments)
         else:
             raise ValueError(f"Wrong number of '_' arguments (must be 3 or 4): {args.mode}")
