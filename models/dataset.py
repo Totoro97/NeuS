@@ -183,10 +183,17 @@ class Dataset:
 
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1), rgb.cuda(), mask.cuda()
 
-    def gen_random_rays_at(self, scene_idx, image_idx, batch_size):
+    def gen_random_rays_at(self, batch_size, scene_idx, image_idx=None):
         """
         Generate random rays at world space from one camera.
+
+        image_idx:
+            None or int
+            If None, sample from all images in scene `scene_idx`.
         """
+        if image_idx is None:
+            raise NotImplementedError
+
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
 

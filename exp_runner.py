@@ -57,8 +57,11 @@ class Runner:
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
         self.batch_size = self.conf.get_int('train.batch_size')
         self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
-        self.learning_rate = self.conf.get_float('train.learning_rate')
+        self.base_learning_rate = self.conf.get_float('train.learning_rate')
         self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
+        self.learning_rate_reduce_steps = \
+            [int(x) for x in self.conf.get_list('train.learning_rate_reduce_steps')]
+        self.learning_rate_reduce_factor = self.conf.get_float('train.learning_rate_reduce_factor')
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
@@ -84,7 +87,7 @@ class Runner:
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
 
-        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+        self.optimizer = torch.optim.Adam(params_to_train, lr=1e10)
 
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
@@ -116,17 +119,18 @@ class Runner:
 
     def train(self):
         self.writer = SummaryWriter(log_dir=self.base_exp_dir)
-        self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
         data_idxs = self.get_dataset_indices()
 
         for iter_i in tqdm(range(res_step)):
+            start_time = time.time()
+
             # Shuffle every so often
             if self.iter_step % len(data_idxs) == 0:
                 random.shuffle(data_idxs)
 
             scene_idx, image_idx = data_idxs[self.iter_step % len(data_idxs)]
-            data = self.dataset.gen_random_rays_at(scene_idx, image_idx, self.batch_size)
+            data = self.dataset.gen_random_rays_at(self.batch_size, scene_idx, image_idx)
 
             rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
@@ -165,9 +169,12 @@ class Runner:
                    eikonal_loss * self.igr_weight +\
                    mask_loss * self.mask_weight
 
+            learning_rate = self.update_learning_rate() # the value is only needed for logging
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+
+            step_time = time.time() - start_time
 
             with torch.no_grad():
                 self.iter_step += 1
@@ -177,8 +184,10 @@ class Runner:
                 self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
                 self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
                 self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+                self.writer.add_scalar('Statistics/Learning rate', learning_rate, self.iter_step)
                 self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
                 self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+                self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
 
                 if self.iter_step % self.report_freq == 0:
                     print(self.base_exp_dir)
@@ -187,13 +196,11 @@ class Runner:
                 if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
                     self.save_checkpoint()
 
-                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
+                if self.iter_step % self.val_freq == 0: # or self.iter_step == 1:
                     self.validate_images(self.val_images_idxs)
 
                 if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                     self.validate_mesh()
-
-                self.update_learning_rate()
 
     def get_dataset_indices(self):
         # Generate all possible pairs (scene_idx, image_idx)
@@ -218,8 +225,16 @@ class Runner:
             progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end)
             learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
+        learning_rate = self.base_learning_rate * learning_factor
+
+        for reduce_step in self.learning_rate_reduce_steps:
+            if self.iter_step >= reduce_step:
+                learning_rate *= self.learning_rate_reduce_factor
+
         for g in self.optimizer.param_groups:
-            g['lr'] = self.learning_rate * learning_factor
+            g['lr'] = learning_rate
+
+        return learning_rate
 
     def file_backup(self):
         dir_lis = self.conf['general.recording']

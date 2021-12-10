@@ -14,6 +14,7 @@ class SDFNetwork(nn.Module):
                  d_hidden,
                  n_layers,
                  n_scenes,
+                 scenewise_split_type='interleave',
                  skip_in=(4,),
                  multires=0,
                  bias=0.5,
@@ -26,8 +27,25 @@ class SDFNetwork(nn.Module):
             int
             Spawn `n_scenes` copies of every other layer, each trained independently. During the
             forward pass, take a scene index `i` and use the `i`th copy at each such layer.
+
+        scenewise_split_type
+            str
+            One of:
+            - 'interleave'
+            - 'interleave_with_skips'
+            - 'append_half'
+            - 'prepend_half'
+            - 'replace_last_half'
+            - 'replace_first_half'
         """
         super().__init__()
+
+        self.scenewise_split_type = scenewise_split_type
+        if scenewise_split_type in ('append_half', 'prepend_half'):
+            num_scene_specific_layers = (n_layers + 1) // 2
+            n_layers += num_scene_specific_layers
+        elif scenewise_split_type in ('replace_last_half', 'replace_first_half'):
+            num_scene_specific_layers = (n_layers + 1) // 2
 
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
@@ -38,13 +56,13 @@ class SDFNetwork(nn.Module):
             self.embed_fn_fine = embed_fn
             dims[0] = input_ch
 
-        self.num_layers = len(dims)
+        self.num_layers = len(dims) - 1
         self.skip_in = skip_in
         self.scale = scale
 
         total_scene_specific_layers = 0
 
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers):
             if l + 1 in self.skip_in:
                 out_dim = dims[l + 1] - dims[0]
             else:
@@ -54,7 +72,7 @@ class SDFNetwork(nn.Module):
                 lin = nn.Linear(dims[l], out_dim)
 
                 if geometric_init:
-                    if l == self.num_layers - 2:
+                    if l == self.num_layers - 1:
                         if not inside_outside:
                             torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
                             torch.nn.init.constant_(lin.bias, -bias)
@@ -78,7 +96,19 @@ class SDFNetwork(nn.Module):
 
                 return lin
 
-            if l % 2 == 1 and dims[l] == out_dim:
+            if scenewise_split_type == 'interleave':
+                layer_is_scene_specific = l % 2 == 1
+            elif scenewise_split_type == 'interleave_with_skips':
+                layer_is_scene_specific = l % 2 == 1 and dims[l] == out_dim
+            elif scenewise_split_type in ('append_half', 'replace_last_half'):
+                layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
+                layer_is_scene_specific = l < num_scene_specific_layers
+            else:
+                raise ValueError(
+                    f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
+
+            if layer_is_scene_specific:
                 lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 total_scene_specific_layers += 1
             else:
@@ -88,7 +118,7 @@ class SDFNetwork(nn.Module):
 
         logging.info(
             f"SDF network got {total_scene_specific_layers} (out of " \
-            f"{self.num_layers - 1}) scene-specific layers")
+            f"{self.num_layers}) scene-specific layers")
 
         self.activation = nn.Softplus(beta=100)
 
@@ -98,23 +128,24 @@ class SDFNetwork(nn.Module):
             inputs = self.embed_fn_fine(inputs)
 
         x = inputs
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers):
             lin = getattr(self, "lin" + str(l))
             layer_is_scene_specific = type(lin) is torch.nn.ModuleList
 
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
-                skip_connection = x
+                if self.scenewise_split_type == 'interleave_with_skips':
+                    skip_connection = x
 
             if l in self.skip_in:
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
 
             x = lin(x)
 
-            if layer_is_scene_specific:
+            if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips':
                 x += skip_connection
 
-            if l < self.num_layers - 2:
+            if l < self.num_layers - 1:
                 x = self.activation(x)
 
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
@@ -147,6 +178,7 @@ class RenderingNetwork(nn.Module):
                  d_hidden,
                  n_layers,
                  n_scenes,
+                 scenewise_split_type='interleave',
                  weight_norm=True,
                  multires_view=0,
                  squeeze_out=True):
@@ -154,6 +186,14 @@ class RenderingNetwork(nn.Module):
 
         self.mode = mode
         self.squeeze_out = squeeze_out
+
+        self.scenewise_split_type = scenewise_split_type
+        if scenewise_split_type in ('append_half', 'prepend_half'):
+            num_scene_specific_layers = (n_layers + 1) // 2
+            n_layers += num_scene_specific_layers
+        elif scenewise_split_type in ('replace_last_half', 'replace_first_half'):
+            num_scene_specific_layers = (n_layers + 1) // 2
+
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embedview_fn = None
@@ -162,11 +202,11 @@ class RenderingNetwork(nn.Module):
             self.embedview_fn = embedview_fn
             dims[0] += (input_ch - 3)
 
-        self.num_layers = len(dims)
+        self.num_layers = len(dims) - 1
 
         total_scene_specific_layers = 0
 
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers):
             out_dim = dims[l + 1]
 
             def create_linear_layer():
@@ -177,7 +217,19 @@ class RenderingNetwork(nn.Module):
 
                 return lin
 
-            if l % 2 == 1 and dims[l] == out_dim:
+            if scenewise_split_type == 'interleave':
+                layer_is_scene_specific = l % 2 == 1
+            elif scenewise_split_type == 'interleave_with_skips':
+                layer_is_scene_specific = l % 2 == 1 and dims[l] == out_dim
+            elif scenewise_split_type in ('append_half', 'replace_last_half'):
+                layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
+            elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
+                layer_is_scene_specific = l < num_scene_specific_layers
+            else:
+                raise ValueError(
+                    f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
+
+            if layer_is_scene_specific:
                 lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
                 total_scene_specific_layers += 1
             else:
@@ -187,7 +239,7 @@ class RenderingNetwork(nn.Module):
 
         logging.info(
             f"Rendering network got {total_scene_specific_layers} (out of " \
-            f"{self.num_layers - 1}) scene-specific layers")
+            f"{self.num_layers}) scene-specific layers")
 
         self.relu = nn.ReLU()
 
@@ -206,20 +258,21 @@ class RenderingNetwork(nn.Module):
 
         x = rendering_input
 
-        for l in range(0, self.num_layers - 1):
+        for l in range(0, self.num_layers):
             lin = getattr(self, "lin" + str(l))
             layer_is_scene_specific = type(lin) is torch.nn.ModuleList
 
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
-                skip_connection = x
+                if self.scenewise_split_type == 'interleave_with_skips':
+                    skip_connection = x
 
             x = lin(x)
 
-            if layer_is_scene_specific:
+            if layer_is_scene_specific and self.scenewise_split_type == 'interleave_with_skips':
                 x += skip_connection
 
-            if l < self.num_layers - 2:
+            if l < self.num_layers - 1:
                 x = self.relu(x)
 
         if self.squeeze_out:
