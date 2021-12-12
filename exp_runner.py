@@ -120,20 +120,20 @@ class Runner:
     def train(self):
         self.writer = SummaryWriter(log_dir=self.base_exp_dir)
         res_step = self.end_iter - self.iter_step
-        data_idxs = self.get_dataset_indices()
+
+        data_loader = iter(self.dataset.get_dataloader())
 
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
 
-            # Shuffle every so often
-            if self.iter_step % len(data_idxs) == 0:
-                random.shuffle(data_idxs)
+            scene_idx, (rays_o, rays_d, true_rgb, mask, near, far) = next(data_loader)
 
-            scene_idx, image_idx = data_idxs[self.iter_step % len(data_idxs)]
-            data = self.dataset.gen_random_rays_at(self.batch_size, scene_idx, image_idx)
-
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
-            near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+            rays_o = rays_o.cuda()
+            rays_d = rays_d.cuda()
+            true_rgb = true_rgb.cuda()
+            mask = mask.cuda()
+            near = near.cuda()
+            far = far.cuda()
 
             background_rgb = None
             if self.use_white_bkgd:
@@ -201,15 +201,6 @@ class Runner:
 
                 if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                     self.validate_mesh()
-
-    def get_dataset_indices(self):
-        # Generate all possible pairs (scene_idx, image_idx)
-        num_images = list(map(len, self.dataset.images))
-        all_data_idxs = [(scene_idx, image_idx) \
-            for scene_idx in range(self.dataset.num_scenes) \
-            for image_idx in range(num_images[scene_idx])]
-
-        return all_data_idxs
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end == 0.0:
@@ -295,27 +286,26 @@ class Runner:
         psnr_val = []
 
         for val_scene_idx, val_image_idx in tqdm(idxs):
-            rays_o, rays_d, true_rgb, mask = self.dataset.gen_rays_at(
+            rays_o, rays_d, true_rgb, mask, near, far = self.dataset.gen_rays_at(
                 val_scene_idx, val_image_idx, resolution_level=resolution_level)
 
-            true_rgb = true_rgb.cpu()
-            mask = mask.cpu()
-
             H, W, _ = rays_o.shape
-            rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
-            rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
+            rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
+            rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
+            near = near.cuda().reshape(-1, 1).split(self.batch_size)
+            far = far.cuda().reshape(-1, 1).split(self.batch_size)
 
             out_rgb_fine = []
             out_normal_fine = []
 
-            for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
-                near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
-                background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+            for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
+                background_rgb = \
+                        torch.ones([1, 3], device=rays_o.device) if self.use_white_bkgd else None
 
                 render_out = self.renderer.render(rays_o_batch,
                                                   rays_d_batch,
-                                                  near,
-                                                  far,
+                                                  near_batch,
+                                                  far_batch,
                                                   val_scene_idx,
                                                   cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                                   background_rgb=background_rgb)
@@ -364,21 +354,22 @@ class Runner:
         """
         Interpolate view between two cameras.
         """
-        rays_o, rays_d = self.dataset.gen_rays_between(
+        rays_o, rays_d, near, far = self.dataset.gen_rays_between(
             scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
-        rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
-        rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
+        rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
+        rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
+        near = near.cuda().reshape(-1, 1).split(self.batch_size)
+        far = far.cuda().reshape(-1, 1).split(self.batch_size)
 
         out_rgb_fine = []
-        for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
-            near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
+        for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
             render_out = self.renderer.render(rays_o_batch,
                                               rays_d_batch,
-                                              near,
-                                              far,
+                                              near_batch,
+                                              far_batch,
                                               scene_idx,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb)
@@ -435,7 +426,7 @@ class Runner:
 if __name__ == '__main__':
     print('Hello Wooden')
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)

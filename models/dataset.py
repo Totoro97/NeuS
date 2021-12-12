@@ -1,12 +1,15 @@
 import torch
-import torch.nn.functional as F
+import torch.utils.data
 import cv2 as cv
 import numpy as np
-import os
-from glob import glob
 from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 from tqdm import tqdm
+
+import collections
+import random
+import os
+from glob import glob
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
 def load_K_Rt_from_P(filename, P=None):
@@ -61,16 +64,17 @@ def load_camera_matrices(path):
     return pose_all, intrinsics_all, scale_mats_np, focal
 
 
-class Dataset:
+class Dataset(torch.utils.data.Dataset):
     def __init__(self, conf):
         super(Dataset, self).__init__()
         print('Load data: Begin')
-        self.device = torch.device('cuda')
+        self.device = torch.device('cpu')
         self.conf = conf
 
         # Retrieve config values
         self.data_dirs = conf.get_list('data_dirs')
         self.num_scenes = len(self.data_dirs)
+        self.batch_size = conf.get_int('batch_size')
 
         render_cameras_name = conf.get_string('render_cameras_name')
 
@@ -79,10 +83,12 @@ class Dataset:
             images_lis = sorted(glob(os.path.join(root_dir, 'image/*.png')))
             n_images = len(images_lis)
             # [n_images, H, W, 3], uint8
-            images = np.stack([cv.imread(im_name) for im_name in images_lis])
+            images = torch.stack(
+                [torch.from_numpy(cv.imread(im_name)) for im_name in images_lis])
             masks_lis = sorted(glob(os.path.join(root_dir, 'mask/*.png')))
             # [n_images, H, W, 1], uint8
-            masks = np.stack([cv.imread(im_name)[..., 0] for im_name in masks_lis])
+            masks = torch.stack(
+                [torch.from_numpy(cv.imread(im_name)[..., 0]) for im_name in masks_lis])
 
             # Load camera parameters
             pose_all, intrinsics_all, scale_mats_np, focal = \
@@ -114,6 +120,12 @@ class Dataset:
 
         print('Load data: End')
 
+    def __len__(self):
+        return self.num_scenes
+
+    def __getitem__(self, i):
+        return i, self.gen_random_rays_at(self.batch_size, i)
+
     def get_image_and_mask(self, scene_idx, image_idx, resolution_level=1):
         # Using nearest neighbors because it's not Mip-NeRF yet
         def resize_and_convert(image, scale):
@@ -122,8 +134,8 @@ class Dataset:
             return torch.from_numpy(image.astype(np.float32) / 255.0)
 
         scale = 1.0 / resolution_level
-        image = resize_and_convert(self.images[scene_idx][image_idx], scale)
-        mask = resize_and_convert(self.masks[scene_idx][image_idx], scale)[..., None]
+        image = resize_and_convert(self.images[scene_idx][image_idx].numpy(), scale)
+        mask = resize_and_convert(self.masks[scene_idx][image_idx].numpy(), scale)[..., None]
 
         return image, mask
 
@@ -181,7 +193,11 @@ class Dataset:
 
         rgb, mask = self.get_image_and_mask(scene_idx, image_idx, resolution_level)
 
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1), rgb.cuda(), mask.cuda()
+        rays_o = rays_o.transpose(0, 1)
+        rays_v = rays_v.transpose(0, 1)
+        near, far = self.near_far_from_sphere(rays_o, rays_v)
+
+        return rays_o, rays_v, rgb.to(self.device), mask.to(self.device), near, far
 
     def gen_random_rays_at(self, batch_size, scene_idx, image_idx=None):
         """
@@ -189,24 +205,53 @@ class Dataset:
 
         image_idx:
             None or int
-            If None, sample from all images in scene `scene_idx`.
+            If None, sample from 5 random images in scene `scene_idx`.
         """
-        if image_idx is None:
-            raise NotImplementedError
-
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
 
-        rgb, mask = self.get_image_and_mask(scene_idx, image_idx)
-        rgb = rgb.cuda()[(pixels_y, pixels_x)]    # batch_size, 3
-        mask = mask.cuda()[(pixels_y, pixels_x)]  # batch_size, 1
+        # Determine which images to use
+        if image_idx is None:
+            NUM_IMAGES_TO_USE = 5
+            num_images_in_scene = len(self.images[scene_idx])
+            num_images_to_use = min(NUM_IMAGES_TO_USE, num_images_in_scene)
 
-        pixels = torch.stack([pixels_x, pixels_y], dim=-1).float()
-        rays_o, rays_v = Dataset.gen_rays(
-            pixels, self.pose_all[scene_idx][image_idx, :3, :4],
-            self.intrinsics_all_inv[scene_idx][image_idx, :3, :3], self.H, self.W)
+            images_idxs_to_use = list(range(num_images_in_scene))
+            random.shuffle(images_idxs_to_use)
+            images_idxs_to_use = images_idxs_to_use[:num_images_to_use]
+            rays_per_image = (batch_size + num_images_to_use - 1) // num_images_to_use
+        else:
+            images_idxs_to_use = [image_idx]
+            rays_per_image = batch_size
 
-        return torch.cat([rays_o, rays_v, rgb, mask], dim=-1)  # batch_size, 10
+        data_to_concat = collections.defaultdict(list)
+
+        for i, current_image_idx in enumerate(images_idxs_to_use):
+            rgb, mask = self.get_image_and_mask(scene_idx, current_image_idx)
+
+            rays_range = slice(i * rays_per_image, (i + 1) * rays_per_image)
+            current_pixels_x = pixels_x[rays_range]
+            current_pixels_y = pixels_y[rays_range]
+
+            rgb = rgb[(current_pixels_y, current_pixels_x)]    # batch_size, 3
+            mask = mask[(current_pixels_y, current_pixels_x)]  # batch_size, 1
+
+            current_pixels = torch.stack([current_pixels_x, current_pixels_y], dim=-1).float()
+            rays_o, rays_v = Dataset.gen_rays(
+                current_pixels, self.pose_all[scene_idx][current_image_idx, :3, :4],
+                self.intrinsics_all_inv[scene_idx][current_image_idx, :3, :3], self.H, self.W)
+
+            data_to_concat['rays_o'].append(rays_o)
+            data_to_concat['rays_v'].append(rays_v)
+            data_to_concat['rgb'].append(rgb)
+            data_to_concat['mask'].append(mask)
+
+        for k, v in data_to_concat.items():
+            data_to_concat[k] = torch.cat(v)
+
+        near, far = self.near_far_from_sphere(data_to_concat['rays_o'], data_to_concat['rays_v'])
+
+        return tuple(data_to_concat[k] for k in ('rays_o', 'rays_v', 'rgb', 'mask')) + (near, far)
 
     def gen_rays_between(self, scene_idx, image_idx_0, image_idx_1, ratio, resolution_level=1):
         """
@@ -235,11 +280,17 @@ class Dataset:
         pose[:3, :3] = rot.as_matrix()
         pose[:3, 3] = ((1.0 - ratio) * pose_0 + ratio * pose_1)[:3, 3]
         pose = np.linalg.inv(pose)
-        rot = torch.from_numpy(pose[:3, :3]).cuda()
-        trans = torch.from_numpy(pose[:3, 3]).cuda()
+        rot = torch.from_numpy(pose[:3, :3]).to(self.device)
+        trans = torch.from_numpy(pose[:3, 3]).to(self.device)
         rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
         rays_o = trans[None, None, :3].expand(rays_v.shape)  # W, H, 3
-        return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
+
+        rays_o = rays_o.transpose(0, 1)
+        rays_v = rays_v.transpose(0, 1)
+
+        near, far = self.near_far_from_sphere(rays_o, rays_v)
+
+        return rays_o, rays_v, near, far
 
     def near_far_from_sphere(self, rays_o, rays_d):
         a = torch.sum(rays_d**2, dim=-1, keepdim=True)
@@ -249,3 +300,25 @@ class Dataset:
         far = mid + 1.0
         return near, far
 
+    def get_dataloader(self):
+        class InfiniteDataLoader(torch.utils.data.DataLoader):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                # Initialize an iterator over the dataset.
+                self.dataset_iterator = super().__iter__()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    batch = next(self.dataset_iterator)
+                except StopIteration:
+                    # Dataset exhausted, use a new fresh iterator.
+                    self.dataset_iterator = super().__iter__()
+                    batch = next(self.dataset_iterator)
+                return batch
+
+        return InfiniteDataLoader(
+            self, batch_size=1, shuffle=True, num_workers=1,
+            collate_fn=lambda x: x[0], pin_memory=True)
