@@ -301,24 +301,24 @@ class Dataset(torch.utils.data.Dataset):
         return near, far
 
     def get_dataloader(self):
-        class InfiniteDataLoader(torch.utils.data.DataLoader):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                # Initialize an iterator over the dataset.
-                self.dataset_iterator = super().__iter__()
+        class InfiniteRandomSampler(torch.utils.data.Sampler):
+            def __init__(self, dataset_length):
+                self.dataset_length = dataset_length
+
+            def __len__(self):
+                return 10 ** 20
 
             def __iter__(self):
-                return self
+                def indices_generator(dataset_length):
+                    indices = list(range(dataset_length))
 
-            def __next__(self):
-                try:
-                    batch = next(self.dataset_iterator)
-                except StopIteration:
-                    # Dataset exhausted, use a new fresh iterator.
-                    self.dataset_iterator = super().__iter__()
-                    batch = next(self.dataset_iterator)
-                return batch
+                    while True:
+                        random.shuffle(indices)
+                        yield from indices
 
-        return InfiniteDataLoader(
-            self, batch_size=1, shuffle=True, num_workers=1,
+                return indices_generator(self.dataset_length)
+
+        return torch.utils.data.DataLoader(
+            self, batch_size=1, num_workers=1,
+            sampler=InfiniteRandomSampler(len(self)),
             collate_fn=lambda x: x[0], pin_memory=True)
