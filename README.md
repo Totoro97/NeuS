@@ -1,5 +1,5 @@
 # NeuS
-We present a novel neural surface reconstruction method, called NeuS, for reconstructing objects and scenes with high fidelity from 2D image inputs.
+We present a novel neural surface reconstruction method, called NeuS (pronunciation: /nuːz/, same as "news"), for reconstructing objects and scenes with high fidelity from 2D image inputs.
 
 ![](./static/intro_1_compressed.gif)
 ![](./static/intro_2_compressed.gif)
