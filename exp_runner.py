@@ -1,5 +1,5 @@
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF
 from models.renderer import NeuSRenderer
 
 import cv2
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from icecream import ic
 from tqdm import tqdm
-from pyhocon import ConfigFactory
+from pyhocon import ConfigFactory, ConfigTree
 
 import random
 import pathlib
@@ -27,18 +27,81 @@ def psnr(color_fine, true_rgb, mask):
     return 20.0 * torch.log10(
         1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask.sum() * 3.0 + 1e-5)).sqrt())
 
-def load_config(conf_path):
-    with open(conf_path) as f:
-        return ConfigFactory.parse_string(f.read())
-
 
 class Runner:
-    def __init__(self, conf_path, mode='train'):
+    def __init__(self, conf_path, checkpoint_path=None, mode='train'):
         self.device = torch.device('cuda')
 
-        # Configuration
+        assert conf_path or checkpoint_path, "Specify at least config or checkpoint"
+
+        # The eventual configuration, gradually filled from various sources
+        self.conf = ConfigFactory.parse_string("")
+
+        def update_config_tree(target: ConfigTree, source: ConfigTree, current_prefix: str = ''):
+            """
+            Recursively update values in `target` with those in `source`.
+
+            current_prefix:
+                str
+                No effect, only used for logging.
+            """
+            for key in source.keys():
+                if key not in target:
+                    target[key] = source[key]
+                else:
+                    assert type(source[key]) == type(target[key]), \
+                        f"Types differ in ConfigTrees: asked to update '{type(target[key])}' " \
+                        f"with '{type(source[key])}' at key '{current_prefix}{key}'"
+
+                    if type(source[key]) is ConfigTree:
+                        update_config_tree(target[key], source[key], f'{current_prefix}{key}.')
+                    else:
+                        if target[key] != source[key]:
+                            logging.info(
+                                f"Updating config value at '{current_prefix}{key}'. "
+                                f"Old: '{target[key]}', new: '{source[key]}'")
+
+                        target[key] = source[key]
+
+        # Load the config file, for now just to extract the checkpoint path from it
         self.conf_path = conf_path
-        self.conf = load_config(conf_path)
+        if conf_path is not None:
+            logging.info(f"Using config '{conf_path}'")
+            config_from_file = ConfigFactory.parse_file(conf_path)
+
+            checkpoint_path_from_config = \
+                config_from_file.get_string('train.checkpoint_path', default=None)
+
+            if checkpoint_path is None:
+                checkpoint_path = checkpoint_path_from_config
+
+        # Try to find the latest checkpoint
+        if checkpoint_path is None:
+            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
+            if checkpoints_dir.is_dir():
+                checkpoints = sorted(checkpoints_dir.iterdir())
+            else:
+                checkpoints = []
+
+            if checkpoints:
+                checkpoint_path = checkpoints[-1]
+
+        # Load the checkpoint, for now just to extract config from there
+        if checkpoint_path is not None:
+            logging.info(f"Loading checkpoint '{checkpoint_path}'")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+            if 'config' in checkpoint:
+                # Temporary dynamic defaults for backward compatibility. TODO: remove
+                if 'dataset.original_num_scenes' not in checkpoint['config']:
+                    checkpoint['config']['dataset']['original_num_scenes'] = \
+                        len(checkpoint['config']['dataset.data_dirs'])
+
+                update_config_tree(self.conf, checkpoint['config'])
+
+        # Now actually process the config file and merge it
+        if conf_path is not None:
+            update_config_tree(self.conf, config_from_file)
 
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
@@ -67,27 +130,40 @@ class Runner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
         self.iter_step = None if self.restart_from_iter is None else self.restart_from_iter
+        del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
+
+        self.finetune = self.conf.get_bool('train.finetune', default=False)
+        self.train_scenewise_layers_only = \
+            self.conf.get_bool('train.train_scenewise_layers_only', default=False)
+        load_optimizer = \
+            self.conf.get_bool('train.load_optimizer', default=not self.finetune)
+
+        if self.finetune:
+            assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
-        self.checkpoint_path = self.conf.get_string('train.checkpoint_path', default=None)
         self.mode = mode
         self.model_list = []
         self.writer = None
 
         # Networks
-        params_to_train = []
-        self.nerf_outside = torch.nn.ModuleList([NeRF(**self.conf['model.nerf']).to(self.device) for _ in range(self.dataset.num_scenes)])
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=self.dataset.num_scenes).to(self.device)
+        current_num_scenes = self.conf.get_int('dataset.original_num_scenes', default=self.dataset.num_scenes)
+        self.nerf_outside = MultiSceneNeRF(**self.conf['model.nerf'], n_scenes=current_num_scenes).to(self.device)
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network'], n_scenes=current_num_scenes).to(self.device)
+        self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
-        self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=self.dataset.num_scenes).to(self.device)
-        params_to_train += list(self.nerf_outside.parameters())
-        params_to_train += list(self.sdf_network.parameters())
-        params_to_train += list(self.deviation_network.parameters())
-        params_to_train += list(self.color_network.parameters())
 
-        self.optimizer = torch.optim.Adam(params_to_train, lr=1e10)
+        def get_optimizer(scenewise_layers_only=False):
+            params_to_train = []
+            params_to_train += list(self.nerf_outside.parameters(scenewise_layers_only))
+            params_to_train += list(self.sdf_network.parameters(scenewise_layers_only))
+            params_to_train += list(self.deviation_network.parameters())
+            params_to_train += list(self.color_network.parameters(scenewise_layers_only))
+            logging.info(f"Got {len(params_to_train)} trainable tensors")
+
+            return torch.optim.Adam(params_to_train, lr=1e10)
 
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
@@ -95,23 +171,21 @@ class Runner:
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
 
-        # Try to find the latest checkpoint
-        if self.checkpoint_path is None:
-            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
-            if checkpoints_dir.is_dir():
-                checkpoints = sorted(checkpoints_dir.iterdir())
-            else:
-                checkpoints = []
+        if load_optimizer:
+            self.optimizer = get_optimizer()
 
-            if checkpoints:
-                self.checkpoint_path = checkpoints[-1]
+        self.load_checkpoint(checkpoint, load_optimizer)
 
-        # Load checkpoint
-        if self.checkpoint_path is None:
-            self.iter_step = self.iter_step or 0
-        else:
-            logging.info(f"Loading from checkpoint {self.checkpoint_path}")
-            self.load_checkpoint(self.checkpoint_path)
+        if self.finetune:
+            self.sdf_network.switch_to_finetuning()
+            self.color_network.switch_to_finetuning()
+            self.nerf_outside.switch_to_finetuning()
+
+        if not load_optimizer:
+            self.optimizer = get_optimizer(self.train_scenewise_layers_only)
+
+        # In case of finetuning
+        self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes
 
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
@@ -193,7 +267,7 @@ class Runner:
                     print(self.base_exp_dir)
                     print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-                if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter:
+                if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                     self.save_checkpoint()
 
                 if self.iter_step % self.val_freq == 0: # or self.iter_step == 1:
@@ -240,13 +314,33 @@ class Runner:
 
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
-    def load_checkpoint(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.nerf_outside.load_state_dict(checkpoint['nerf'])
-        self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
-        self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
-        self.color_network.load_state_dict(checkpoint['color_network_fine'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+    def load_checkpoint(self, checkpoint: dict, load_optimizer: bool = True):
+        def load_weights(module, state_dict):
+            # backward compatibility:
+            # replace 'lin(0-9)' (old convention) with 'linear_layers.' (new convention)
+            for tensor_name in list(state_dict.keys()):
+                if tensor_name.startswith('lin') and tensor_name[3].isdigit():
+                    new_tensor_name = f'linear_layers.{tensor_name[3:]}'
+                    state_dict[new_tensor_name] = state_dict[tensor_name]
+                    del state_dict[tensor_name]
+
+            module.load_state_dict(state_dict)
+            # missing_keys, unexpected_keys = module.load_state_dict(state_dict, strict=False)
+
+            # if missing_keys:
+            #     raise RuntimeError(
+            #         f"Missing keys in checkpoint: {missing_keys}\n" \
+            #         f"Unexpected keys: {unexpected_keys}")
+            # if unexpected_keys:
+            #     logging.warning(f"Ignoring unexpected keys in checkpoint: {unexpected_keys}")
+
+        load_weights(self.nerf_outside, checkpoint['nerf'])
+        load_weights(self.sdf_network, checkpoint['sdf_network_fine'])
+        load_weights(self.deviation_network, checkpoint['variance_network_fine'])
+        load_weights(self.color_network, checkpoint['color_network_fine'])
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+
         if self.iter_step is None:
             self.iter_step = checkpoint['iter_step']
 
@@ -260,10 +354,11 @@ class Runner:
             'color_network_fine': self.color_network.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'iter_step': self.iter_step,
+            'config': self.conf,
         }
 
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
-        torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
+        torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', f'ckpt_{self.iter_step:07d}.pth'))
 
     def validate_images(self, idxs=[-1], resolution_level=-1):
         def get_random_dataset_idx():
@@ -432,7 +527,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='./confs/base.conf')
+    parser.add_argument('--conf', type=pathlib.Path, default=None)
+    parser.add_argument('--checkpoint_path', type=pathlib.Path, default=None)
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
     parser.add_argument('--gpu', type=int, default=0)
@@ -440,7 +536,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode)
+    runner = Runner(args.conf, args.checkpoint_path, args.mode)
 
     if args.mode == 'train':
         runner.train()
@@ -457,3 +553,5 @@ if __name__ == '__main__':
             raise ValueError(f"Wrong number of '_' arguments (must be 3 or 4): {args.mode}")
 
         runner.interpolate_view(scene_idx, img_idx_0, img_idx_1)
+    else:
+        raise ValueError(f"Wrong '--mode': {args.mode}")

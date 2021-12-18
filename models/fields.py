@@ -60,9 +60,10 @@ class SDFNetwork(nn.Module):
         self.skip_in = skip_in
         self.scale = scale
 
+        self.linear_layers = nn.ModuleList()
         total_scene_specific_layers = 0
 
-        for l in range(0, self.num_layers):
+        for l in range(self.num_layers):
             if l + 1 in self.skip_in:
                 out_dim = dims[l + 1] - dims[0]
             else:
@@ -114,7 +115,7 @@ class SDFNetwork(nn.Module):
             else:
                 lin = create_linear_layer()
 
-            setattr(self, "lin" + str(l), lin)
+            self.linear_layers.append(lin)
 
         logging.info(
             f"SDF network got {total_scene_specific_layers} (out of " \
@@ -128,8 +129,8 @@ class SDFNetwork(nn.Module):
             inputs = self.embed_fn_fine(inputs)
 
         x = inputs
-        for l in range(0, self.num_layers):
-            lin = getattr(self, "lin" + str(l))
+        for l in range(self.num_layers):
+            lin = self.linear_layers[l]
             layer_is_scene_specific = type(lin) is torch.nn.ModuleList
 
             if layer_is_scene_specific:
@@ -167,8 +168,40 @@ class SDFNetwork(nn.Module):
                 only_inputs=True)[0]
             return gradients.unsqueeze(1)
 
+    def switch_to_finetuning(self, algorithm='pick'):
+        """
+        Switch the network trained on multiple scenes to the 'finetuning mode',
+        to finetune it to some new (one) scene.
+
+        algorithm
+            str
+            One of:
+            - pick (take the 0th scene's 'subnetwork')
+        """
+        if algorithm == 'pick':
+            for i in range(self.num_layers):
+                if type(self.linear_layers[i]) is nn.ModuleList:
+                    self.linear_layers[i] = nn.ModuleList([self.linear_layers[i][0]])
+        else:
+            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+    def parameters(self, scenewise_layers_only=False):
+        def is_scene_specific(name: str):
+            name = name.split('.')
+
+            try:
+                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+            except IndexError:
+                return False
+
+        if scenewise_layers_only:
+            return (x for name, x in super().named_parameters() if is_scene_specific(name))
+        else:
+            return super().parameters()
+
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
+# TODO: remove repetitive code from SDFNetwork
 class RenderingNetwork(nn.Module):
     def __init__(self,
                  d_feature,
@@ -204,6 +237,7 @@ class RenderingNetwork(nn.Module):
 
         self.num_layers = len(dims) - 1
 
+        self.linear_layers = nn.ModuleList()
         total_scene_specific_layers = 0
 
         for l in range(0, self.num_layers):
@@ -235,7 +269,7 @@ class RenderingNetwork(nn.Module):
             else:
                 lin = create_linear_layer()
 
-            setattr(self, "lin" + str(l), lin)
+            self.linear_layers.append(lin)
 
         logging.info(
             f"Rendering network got {total_scene_specific_layers} (out of " \
@@ -259,7 +293,7 @@ class RenderingNetwork(nn.Module):
         x = rendering_input
 
         for l in range(0, self.num_layers):
-            lin = getattr(self, "lin" + str(l))
+            lin = self.linear_layers[l]
             layer_is_scene_specific = type(lin) is torch.nn.ModuleList
 
             if layer_is_scene_specific:
@@ -279,6 +313,36 @@ class RenderingNetwork(nn.Module):
             x = torch.sigmoid(x)
         return x
 
+    def switch_to_finetuning(self, algorithm='pick'):
+        """
+        Switch the network trained on multiple scenes to the 'finetuning mode',
+        to finetune it to some new (one) scene.
+
+        algorithm
+            str
+            One of:
+            - pick (take the 0th scene's 'subnetwork')
+        """
+        if algorithm == 'pick':
+            for i in range(self.num_layers):
+                if type(self.linear_layers[i]) is nn.ModuleList:
+                    self.linear_layers[i] = nn.ModuleList([self.linear_layers[i][0]])
+        else:
+            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+    def parameters(self, scenewise_layers_only=False):
+        def is_scene_specific(name: str):
+            name = name.split('.')
+
+            try:
+                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+            except IndexError:
+                return False
+
+        if scenewise_layers_only:
+            return (x for name, x in super().named_parameters() if is_scene_specific(name))
+        else:
+            return super().parameters()
 
 # This implementation is borrowed from nerf-pytorch: https://github.com/yenchenlin/nerf-pytorch
 class NeRF(nn.Module):
@@ -361,6 +425,27 @@ class NeRF(nn.Module):
         else:
             assert False
 
+class MultiSceneNeRF(nn.ModuleList):
+    def __init__(self, n_scenes, *args, **kwargs):
+        super().__init__([NeRF(*args, **kwargs) for _ in range(n_scenes)])
+
+    def switch_to_finetuning(self, algorithm='pick'):
+        """
+        Switch the network trained on multiple scenes to the 'finetuning mode',
+        to finetune it to some new (one) scene.
+
+        algorithm
+            str
+            One of:
+            - pick (take the 0th scene's 'subnetwork')
+        """
+        if algorithm == 'pick':
+            super().__init__([self[0]])
+        else:
+            raise ValueError(f"Unknown algorithm: '{algorithm}'")
+
+    def parameters(self, scenewise_layers_only=False):
+        return super().parameters()
 
 class SingleVarianceNetwork(nn.Module):
     def __init__(self, init_val):
