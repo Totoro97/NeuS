@@ -136,8 +136,8 @@ class Dataset(torch.utils.data.Dataset):
 
         all_data = [load_one_scene(data_dir, images_to_pick) for data_dir in tqdm(self.data_dirs)]
         # Transpose
-        self.images, self.masks, self.pose_all, self.intrinsics_all, _, self.focal = \
-            list(zip(*all_data))
+        self.images, self.masks, self.pose_all, self.intrinsics_all, \
+            self.scale_mats_np, self.focal = zip(*all_data)
 
         self.pose_all = [x.to(self.device) for x in self.pose_all]
         self.intrinsics_all = [x.to(self.device) for x in self.intrinsics_all]

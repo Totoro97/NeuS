@@ -494,7 +494,8 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 
         if world_space:
-            vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
+            vertices = vertices * self.dataset.scale_mats_np[scene_idx][0][0, 0] + \
+                self.dataset.scale_mats_np[scene_idx][0][:3, 3][None]
 
         mesh = trimesh.Trimesh(vertices, triangles)
         mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
@@ -507,7 +508,7 @@ class Runner:
         for i in tqdm(range(n_frames)):
             images.append(self.render_novel_image(
                 scene_idx, img_idx_0, img_idx_1,
-                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=4))
+                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2))
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
 
