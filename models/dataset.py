@@ -6,6 +6,8 @@ from scipy.spatial.transform import Rotation as Rot
 from scipy.spatial.transform import Slerp
 from tqdm import tqdm
 
+import logging
+import pathlib
 import collections
 import random
 import os
@@ -67,7 +69,7 @@ def load_camera_matrices(path):
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, conf):
         super(Dataset, self).__init__()
-        print('Load data: Begin')
+        logging.info('Load data: Begin')
         self.device = torch.device('cpu')
         self.conf = conf
 
@@ -75,24 +77,56 @@ class Dataset(torch.utils.data.Dataset):
         self.data_dirs = conf.get_list('data_dirs')
         self.num_scenes = len(self.data_dirs)
         self.batch_size = conf.get_int('batch_size')
+        images_to_pick = conf.get_list('images_to_pick', default=[])
 
         render_cameras_name = conf.get_string('render_cameras_name')
 
-        def load_one_scene(root_dir):
+        def load_one_scene(root_dir: pathlib.Path, images_to_pick: list[str] = []):
+            """
+            images_to_pick
+                list of str or None
+                Names of image files (without extension) to keep.
+                If None, keep all images.
+            """
+            root_dir = pathlib.Path(root_dir)
+
             # Load images
-            images_lis = sorted(glob(os.path.join(root_dir, 'image/*.png')))
-            n_images = len(images_lis)
+            images_list = sorted(x for x in (root_dir / "image").iterdir() if x.suffix == '.png')
+
+            # If requested, don't load all images but pick the specified ones
+            if images_to_pick == []:
+                images_to_pick = [x.with_suffix('').name for x in images_list]
+
+            def get_image_idx(image_file_name):
+                try:
+                    return [i for i, x in enumerate(images_list) if x.with_suffix('').name == image_file_name][0]
+                except IndexError as exc:
+                    raise RuntimeError(f"Asked to pick image '{image_file_name}', couldn't find it") from exc
+
+            image_idxs_to_pick = list(map(get_image_idx, images_to_pick))
+
+            images_list = [images_list[i] for i in image_idxs_to_pick]
+
+            logging.info(f"image_idxs_to_pick = {image_idxs_to_pick}")
+
+            n_images = len(images_list)
             # [n_images, H, W, 3], uint8
             images = torch.stack(
-                [torch.from_numpy(cv.imread(im_name)) for im_name in images_lis])
-            masks_lis = sorted(glob(os.path.join(root_dir, 'mask/*.png')))
+                [torch.from_numpy(cv.imread(str(im_name))) for im_name in images_list])
+
+            masks_list = sorted(x for x in (root_dir / "mask").iterdir() if x.suffix == '.png')
+            masks_list = [masks_list[i] for i in image_idxs_to_pick]
+
             # [n_images, H, W, 1], uint8
             masks = torch.stack(
-                [torch.from_numpy(cv.imread(im_name)[..., 0]) for im_name in masks_lis])
+                [torch.from_numpy(cv.imread(str(im_name))[..., 0]) for im_name in masks_list])
 
             # Load camera parameters
             pose_all, intrinsics_all, scale_mats_np, focal = \
                 load_camera_matrices(os.path.join(root_dir, render_cameras_name))
+            pose_all = pose_all[image_idxs_to_pick]
+            intrinsics_all = intrinsics_all[image_idxs_to_pick]
+            scale_mats_np = [scale_mats_np[i] for i in image_idxs_to_pick]
 
             assert len(pose_all) == n_images
             assert len(intrinsics_all) == n_images
@@ -100,7 +134,7 @@ class Dataset(torch.utils.data.Dataset):
 
             return images, masks, pose_all, intrinsics_all, scale_mats_np, focal
 
-        all_data = [load_one_scene(data_dir) for data_dir in tqdm(self.data_dirs)]
+        all_data = [load_one_scene(data_dir, images_to_pick) for data_dir in tqdm(self.data_dirs)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, _, self.focal = \
             list(zip(*all_data))
@@ -118,7 +152,7 @@ class Dataset(torch.utils.data.Dataset):
         self.object_bbox_min = np.float32([-1.01, -1.01, -1.01])
         self.object_bbox_max = np.float32([ 1.01,  1.01,  1.01])
 
-        print('Load data: End')
+        logging.info('Load data: End')
 
     def __len__(self):
         return self.num_scenes
@@ -322,3 +356,4 @@ class Dataset(torch.utils.data.Dataset):
             self, batch_size=1, num_workers=1,
             sampler=InfiniteRandomSampler(len(self)),
             collate_fn=lambda x: x[0], pin_memory=True)
+

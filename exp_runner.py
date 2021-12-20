@@ -29,7 +29,10 @@ def psnr(color_fine, true_rgb, mask):
 
 
 class Runner:
-    def __init__(self, conf_path, checkpoint_path=None, mode='train'):
+    def __init__(self,
+        conf_path: pathlib.Path, checkpoint_path: pathlib.Path = None,
+        extra_config_args: str = None, mode: str = 'train'):
+
         self.device = torch.device('cuda')
 
         assert conf_path or checkpoint_path, "Specify at least config or checkpoint"
@@ -103,6 +106,10 @@ class Runner:
         if conf_path is not None:
             update_config_tree(self.conf, config_from_file)
 
+        # Finally, update config with extra command line args
+        if extra_config_args is not None:
+            update_config_tree(self.conf, ConfigFactory.parse_string(extra_config_args))
+
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
@@ -130,7 +137,9 @@ class Runner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
         self.iter_step = None if self.restart_from_iter is None else self.restart_from_iter
-        del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
+
+        if 'train.restart_from_iter' in self.conf:
+            del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
         self.train_scenewise_layers_only = \
@@ -529,6 +538,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--conf', type=pathlib.Path, default=None)
     parser.add_argument('--checkpoint_path', type=pathlib.Path, default=None)
+    parser.add_argument('--extra_config_args', type=str, default=None)
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
     parser.add_argument('--gpu', type=int, default=0)
@@ -536,7 +546,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.checkpoint_path, args.mode)
+    runner = Runner(args.conf, args.checkpoint_path, args.extra_config_args, args.mode)
 
     if args.mode == 'train':
         runner.train()
