@@ -80,7 +80,7 @@ class Runner:
 
         # Try to find the latest checkpoint
         if checkpoint_path is None:
-            checkpoints_dir = pathlib.Path(self.base_exp_dir) / "checkpoints"
+            checkpoints_dir = pathlib.Path(config_from_file.get_string('general.base_exp_dir')) / "checkpoints"
             if checkpoints_dir.is_dir():
                 checkpoints = sorted(checkpoints_dir.iterdir())
             else:
@@ -183,7 +183,11 @@ class Runner:
         if load_optimizer:
             self.optimizer = get_optimizer()
 
-        self.load_checkpoint(checkpoint, load_optimizer)
+        if checkpoint_path is not None:
+            self.load_checkpoint(checkpoint, load_optimizer)
+
+        if self.iter_step is None:
+            self.iter_step = 0
 
         if self.finetune:
             self.sdf_network.switch_to_finetuning()
@@ -218,16 +222,12 @@ class Runner:
             near = near.cuda()
             far = far.cuda()
 
+            mask_sum = mask.sum() + 1e-5
+
             background_rgb = None
             if self.use_white_bkgd:
                 background_rgb = torch.ones([1, 3])
 
-            if self.mask_weight > 0.0:
-                mask = (mask > 0.5).float()
-            else:
-                mask = torch.ones_like(mask)
-
-            mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
                                               background_rgb=background_rgb,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio())
@@ -240,17 +240,26 @@ class Runner:
             weight_sum = render_out['weight_sum']
 
             # Loss
-            color_error = (color_fine - true_rgb) * mask
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+            color_error = color_fine - true_rgb
+            if self.mask_weight > 0.0:
+                color_error *= mask
+
+            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum')
+            if self.mask_weight > 0.0:
+                color_fine_loss /= mask_sum
+            else:
+                color_fine_loss /= color_error.numel()
+
             psnr_train = psnr(color_fine, true_rgb, mask)
 
             eikonal_loss = gradient_error
 
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+            loss = color_fine_loss + \
+                   eikonal_loss * self.igr_weight
 
-            loss = color_fine_loss +\
-                   eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+            if self.mask_weight > 0.0:
+                mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+                loss += mask_loss * self.mask_weight
 
             learning_rate = self.update_learning_rate() # the value is only needed for logging
             self.optimizer.zero_grad()
