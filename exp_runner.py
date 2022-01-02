@@ -112,7 +112,8 @@ class Runner:
 
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
-        self.dataset = Dataset(self.conf['dataset'])
+        self.dataset = Dataset(self.conf['dataset'], kind='train')
+        self.dataset_val = Dataset(self.conf['dataset'], kind='val')
 
         logging.info(f"Experiment dir: {self.base_exp_dir}")
 
@@ -123,7 +124,6 @@ class Runner:
         self.val_freq = self.conf.get_int('train.val_freq')
         # List of (scene_idx, image_idx) pairs. Example: [[0, 4], [1, 2]].
         # -1 for random. Examples: [-1] or [[0, 4], -1]
-        self.val_images_idxs = self.conf.get_list('train.val_images_idxs')
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
         self.batch_size = self.conf.get_int('train.batch_size')
         self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
@@ -149,6 +149,7 @@ class Runner:
 
         if self.finetune:
             assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
+            assert self.dataset_val.num_scenes == 1, "Can only finetune to one scene"
 
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
@@ -289,7 +290,7 @@ class Runner:
                     self.save_checkpoint()
 
                 if self.iter_step % self.val_freq == 0: # or self.iter_step == 1:
-                    self.validate_images(self.val_images_idxs)
+                    self.validate_images()
 
                 if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
                     self.validate_mesh()
@@ -302,7 +303,9 @@ class Runner:
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end:
-            learning_factor = self.iter_step / self.warm_up_end
+            learning_factor = \
+                (self.iter_step - (self.restart_from_iter or 0)) / \
+                (self.warm_up_end - (self.restart_from_iter or 0))
         else:
             alpha = self.learning_rate_alpha
             progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end)
@@ -378,81 +381,73 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', f'ckpt_{self.iter_step:07d}.pth'))
 
-    def validate_images(self, idxs=[-1], resolution_level=-1):
-        def get_random_dataset_idx():
-            scene_idx = random.randint(0, self.dataset.num_scenes - 1)
-            image_idx = random.randint(0, len(self.dataset.images[scene_idx]) - 1)
-            return scene_idx, image_idx
+    def validate_images(self, resolution_level=None):
+        print('Validation. Iter: {}'.format(self.iter_step))
 
-        # Treat a plain integer as a camera index in the scene #0
-        idxs = [(0, idx) if type(idx) is int else idx for idx in idxs]
-        # Treat -1s as "pick a random dataset camera"
-        idxs = [get_random_dataset_idx() if idx[0] < 0 else idx for idx in idxs]
-
-        print('Validate: iter: {}, (scene, camera): {}'.format(self.iter_step, idxs))
-
-        if resolution_level < 0:
+        if resolution_level is None:
             resolution_level = self.validate_resolution_level
 
         render_images = []
         normal_images = []
         psnr_val = []
 
-        for val_scene_idx, val_image_idx in tqdm(idxs):
-            rays_o, rays_d, true_rgb, mask, near, far = self.dataset.gen_rays_at(
-                val_scene_idx, val_image_idx, resolution_level=resolution_level)
+        for val_scene_idx in range(self.dataset_val.num_scenes):
+            num_images_per_scene = len(self.dataset_val.images[val_scene_idx])
+            for val_image_idx in range(num_images_per_scene):
+                rays_o, rays_d, true_rgb, mask, near, far = self.dataset_val.gen_rays_at(
+                    val_scene_idx, val_image_idx, resolution_level=resolution_level)
 
-            H, W, _ = rays_o.shape
-            rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
-            rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
-            near = near.cuda().reshape(-1, 1).split(self.batch_size)
-            far = far.cuda().reshape(-1, 1).split(self.batch_size)
+                H, W, _ = rays_o.shape
+                rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
+                rays_d = rays_d.cuda().reshape(-1, 3).split(self.batch_size)
+                near = near.cuda().reshape(-1, 1).split(self.batch_size)
+                far = far.cuda().reshape(-1, 1).split(self.batch_size)
 
-            out_rgb_fine = []
-            out_normal_fine = []
+                out_rgb_fine = []
+                out_normal_fine = []
 
-            for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
-                background_rgb = \
-                        torch.ones([1, 3], device=rays_o.device) if self.use_white_bkgd else None
+                for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
+                    background_rgb = \
+                            torch.ones([1, 3], device=rays_o.device) if self.use_white_bkgd else None
 
-                render_out = self.renderer.render(rays_o_batch,
-                                                  rays_d_batch,
-                                                  near_batch,
-                                                  far_batch,
-                                                  val_scene_idx,
-                                                  cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                                  background_rgb=background_rgb)
+                    render_out = self.renderer.render(rays_o_batch,
+                                                      rays_d_batch,
+                                                      near_batch,
+                                                      far_batch,
+                                                      val_scene_idx,
+                                                      cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                                      background_rgb=background_rgb)
 
-                def feasible(key): return (key in render_out) and (render_out[key] is not None)
+                    def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
-                if feasible('color_fine'):
-                    out_rgb_fine.append(render_out['color_fine'].cpu())
-                if feasible('gradients') and feasible('weights'):
-                    n_samples = self.renderer.n_samples + self.renderer.n_importance
-                    normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
-                    if feasible('inside_sphere'):
-                        normals = normals * render_out['inside_sphere'][..., None]
-                    normals = normals.sum(dim=1).cpu()
-                    out_normal_fine.append(normals)
-                del render_out
+                    if feasible('color_fine'):
+                        out_rgb_fine.append(render_out['color_fine'].cpu())
+                    if feasible('gradients') and feasible('weights'):
+                        n_samples = self.renderer.n_samples + self.renderer.n_importance
+                        normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
+                        if feasible('inside_sphere'):
+                            normals = normals * render_out['inside_sphere'][..., None]
+                        normals = normals.sum(dim=1).cpu()
+                        out_normal_fine.append(normals)
+                    del render_out
 
-            img_fine = torch.cat(out_rgb_fine).reshape(H, W, 3).clamp(0.0, 1.0)
+                img_fine = torch.cat(out_rgb_fine).reshape(H, W, 3).clamp(0.0, 1.0)
 
-            normal_img = torch.cat(out_normal_fine)
-            rot = torch.inverse(self.dataset.pose_all[val_scene_idx][val_image_idx, :3, :3].cpu())
-            normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
-            normal_img = normal_img.clamp(0.0, 1.0)
+                normal_img = torch.cat(out_normal_fine)
+                rot = torch.inverse(self.dataset_val.pose_all[val_scene_idx][val_image_idx, :3, :3].cpu())
+                normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
+                normal_img = normal_img.clamp(0.0, 1.0)
 
-            # os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
-            # os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+                # os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+                # os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
 
-            psnr_val.append(psnr(img_fine, true_rgb, mask))
+                psnr_val.append(psnr(img_fine, true_rgb, mask))
 
-            render_image = torch.cat((img_fine, true_rgb), dim=1)
-            normal_image = normal_img
+                render_image = torch.cat((img_fine, true_rgb), dim=1)
+                normal_image = normal_img
 
-            render_images.append(render_image)
-            normal_images.append(normal_image)
+                render_images.append(render_image)
+                normal_images.append(normal_image)
 
         render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
         normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)

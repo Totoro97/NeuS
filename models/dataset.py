@@ -67,7 +67,7 @@ def load_camera_matrices(path):
 
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, conf):
+    def __init__(self, conf, kind='train'):
         super(Dataset, self).__init__()
         logging.info('Load data: Begin')
         self.device = torch.device('cpu')
@@ -77,25 +77,45 @@ class Dataset(torch.utils.data.Dataset):
         self.data_dirs = conf.get_list('data_dirs')
         self.num_scenes = len(self.data_dirs)
         self.batch_size = conf.get_int('batch_size')
-        images_to_pick = conf.get_list('images_to_pick', default=[])
+
+        # Format for `images_to_pick[_val]` in config:
+        # [[0, ["00747", "00889"]], [2, ["00053"]], ...]
+        images_to_pick_all = conf.get_list(
+            {'train': 'images_to_pick', 'val': 'images_to_pick_val'}[kind], default=None)
+
+        images_to_pick_per_scene = [[] for _ in range(self.num_scenes)]
+        if images_to_pick_all is not None:
+            for scene_idx, image_names in images_to_pick_all:
+                images_to_pick_per_scene[scene_idx] += image_names
 
         render_cameras_name = conf.get_string('render_cameras_name')
 
-        def load_one_scene(root_dir: pathlib.Path, images_to_pick: list[str] = []):
+        def load_one_scene(
+            root_dir: pathlib.Path, images_to_pick: list[str] = [], kind: str = 'train'):
             """
             images_to_pick
-                list of str or None
+                list of str
                 Names of image files (without extension) to keep.
-                If None, keep all images.
+                If empty, behaviour is controlled by `kind`.
+            kind
+                str
+                Defines behavior when `images_to_pick` is empty.
+                If 'train', will load all images in the folder.
+                If 'val', will load the first and the last one (in the sorted list of filenames).
             """
             root_dir = pathlib.Path(root_dir)
 
             # Load images
             images_list = sorted(x for x in (root_dir / "image").iterdir() if x.suffix == '.png')
 
-            # If requested, don't load all images but pick the specified ones
+            # If not specified, load all images
             if images_to_pick == []:
                 images_to_pick = [x.with_suffix('').name for x in images_list]
+                if kind == 'val':
+                    if len(images_list) >= 2:
+                        images_to_pick = [images_to_pick[0], images_to_pick[-1]]
+                else:
+                    assert kind == 'train', f"Wrong 'kind': '{kind}'"
 
             def get_image_idx(image_file_name):
                 try:
@@ -134,7 +154,8 @@ class Dataset(torch.utils.data.Dataset):
 
             return images, masks, pose_all, intrinsics_all, scale_mats_np, focal
 
-        all_data = [load_one_scene(data_dir, images_to_pick) for data_dir in tqdm(self.data_dirs)]
+        all_data = [load_one_scene(data_dir, images_to_pick) \
+            for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, \
             self.scale_mats_np, self.focal = zip(*all_data)
