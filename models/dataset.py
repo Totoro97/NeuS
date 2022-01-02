@@ -12,6 +12,7 @@ import collections
 import random
 import os
 from glob import glob
+import pickle
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
 def load_K_Rt_from_P(filename, P=None):
@@ -83,6 +84,8 @@ class Dataset(torch.utils.data.Dataset):
         images_to_pick_all = conf.get_list(
             {'train': 'images_to_pick', 'val': 'images_to_pick_val'}[kind], default=None)
 
+        # Transpose the above list into
+        # [["00747", "00889"], [], ["00053"], ...]
         images_to_pick_per_scene = [[] for _ in range(self.num_scenes)]
         if images_to_pick_all is not None:
             for scene_idx, image_names in images_to_pick_all:
@@ -127,7 +130,7 @@ class Dataset(torch.utils.data.Dataset):
 
             images_list = [images_list[i] for i in image_idxs_to_pick]
 
-            logging.info(f"image_idxs_to_pick = {image_idxs_to_pick}")
+            logging.info(f"{kind}, image_idxs_to_pick = {image_idxs_to_pick}")
 
             n_images = len(images_list)
             # [n_images, H, W, 3], uint8
@@ -152,13 +155,18 @@ class Dataset(torch.utils.data.Dataset):
             assert len(intrinsics_all) == n_images
             assert len(scale_mats_np) == n_images
 
-            return images, masks, pose_all, intrinsics_all, scale_mats_np, focal
+            # Load object bboxes
+            with open(root_dir / "tabular_data.pkl", 'rb') as f:
+                obj_bboxes = pickle.load(f)['crop_rectangles']
+                obj_bboxes = [obj_bboxes[i][:4] for i in image_idxs_to_pick]
+
+            return images, masks, pose_all, intrinsics_all, scale_mats_np, focal, obj_bboxes
 
         all_data = [load_one_scene(data_dir, images_to_pick) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, \
-            self.scale_mats_np, self.focal = zip(*all_data)
+            self.scale_mats_np, self.focal, self.object_bboxes = zip(*all_data)
 
         self.pose_all = [x.to(self.device) for x in self.pose_all]
         self.intrinsics_all = [x.to(self.device) for x in self.intrinsics_all]
@@ -262,8 +270,7 @@ class Dataset(torch.utils.data.Dataset):
             None or int
             If None, sample from 5 random images in scene `scene_idx`.
         """
-        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
-        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
+        remaining_rays_to_sample = batch_size
 
         # Determine which images to use
         if image_idx is None:
@@ -283,10 +290,15 @@ class Dataset(torch.utils.data.Dataset):
 
         for i, current_image_idx in enumerate(images_idxs_to_use):
             rgb, mask = self.get_image_and_mask(scene_idx, current_image_idx)
+            l, t, r, b = self.object_bboxes[scene_idx][current_image_idx]
 
-            rays_range = slice(i * rays_per_image, (i + 1) * rays_per_image)
-            current_pixels_x = pixels_x[rays_range]
-            current_pixels_y = pixels_y[rays_range]
+            current_rays_to_sample = min(remaining_rays_to_sample, rays_per_image)
+            remaining_rays_to_sample -= current_rays_to_sample
+
+            current_pixels_x = torch.randint(
+                low=max(0, l-1), high=min(self.W, r+1), size=[current_rays_to_sample])
+            current_pixels_y = torch.randint(
+                low=max(0, t-1), high=min(self.H, b+1), size=[current_rays_to_sample])
 
             rgb = rgb[(current_pixels_y, current_pixels_x)]    # batch_size, 3
             mask = mask[(current_pixels_y, current_pixels_x)]  # batch_size, 1

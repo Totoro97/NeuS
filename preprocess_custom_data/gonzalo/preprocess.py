@@ -94,7 +94,7 @@ class ImageCropper:
 
         return:
         crop_rectangle
-            list of length 5
+            list[5] of (int, int, int, int, float)
             Crop rectangle relative to the original image: (l, t, r, b, confidence).
         cropped_image
             np.ndarray, uint8, H1 x W1 x 3, BGR
