@@ -289,7 +289,7 @@ class Runner:
                 if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
                     self.save_checkpoint()
 
-                if self.iter_step % self.val_freq == 0: # or self.iter_step == 1:
+                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
                     self.validate_images()
 
                 if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
@@ -462,7 +462,7 @@ class Runner:
         """
         Interpolate view between two cameras.
         """
-        rays_o, rays_d, near, far = self.dataset.gen_rays_between(
+        rays_o, rays_d, near, far, pose = self.dataset.gen_rays_between(
             scene_idx, idx_0, idx_1, ratio, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
         rays_o = rays_o.cuda().reshape(-1, 3).split(self.batch_size)
@@ -470,7 +470,9 @@ class Runner:
         near = near.cuda().reshape(-1, 1).split(self.batch_size)
         far = far.cuda().reshape(-1, 1).split(self.batch_size)
 
-        out_rgb_fine = []
+        rgb_all = []
+        normals_all = []
+
         for rays_o_batch, rays_d_batch, near_batch, far_batch in zip(rays_o, rays_d, near, far):
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
@@ -482,12 +484,27 @@ class Runner:
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb)
 
-            out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
+            rgb_all.append(render_out['color_fine'].detach().cpu().numpy())
+
+            def feasible(key): return (key in render_out) and (render_out[key] is not None)
+
+            n_samples = self.renderer.n_samples + self.renderer.n_importance
+            normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
+            if feasible('inside_sphere'):
+                normals = normals * render_out['inside_sphere'][..., None]
+            normals = normals.sum(dim=1).cpu().numpy()
+            normals_all.append(normals)
 
             del render_out
 
-        img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 255).clip(0, 255).astype(np.uint8)
-        return img_fine
+        img_fine = (np.concatenate(rgb_all, axis=0).reshape([H, W, 3]) * 255).clip(0, 255).astype(np.uint8)
+
+        normal_img = np.concatenate(normals_all)
+        rot = pose[:3, :3]
+        normal_img = ((rot[None, :, :] @ normal_img[:, :, None]).reshape(H, W, 3) * 0.5 + 0.5)
+        normal_img = (normal_img.clip(0.0, 1.0) * 255).astype(np.uint8)
+
+        return img_fine, normal_img
 
     def validate_mesh(self, scene_idx=0, world_space=False, resolution=64, threshold=0.0):
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
@@ -510,9 +527,12 @@ class Runner:
         images = []
         n_frames = 30
         for i in tqdm(range(n_frames)):
-            images.append(self.render_novel_image(
+            image, normals = self.render_novel_image(
                 scene_idx, img_idx_0, img_idx_1,
-                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2))
+                np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5, resolution_level=2)
+            video_frame = np.concatenate([image, normals], axis=0)
+
+            images.append(video_frame)
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
 
@@ -556,7 +576,8 @@ if __name__ == '__main__':
     if args.mode == 'train':
         runner.train()
     elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+        with torch.no_grad():
+            runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate_'):
         # Interpolate views given [optional: scene index and] two image indices
         arguments = args.mode.split('_')[1:]
@@ -567,6 +588,7 @@ if __name__ == '__main__':
         else:
             raise ValueError(f"Wrong number of '_' arguments (must be 3 or 4): {args.mode}")
 
-        runner.interpolate_view(scene_idx, img_idx_0, img_idx_1)
+        with torch.no_grad():
+            runner.interpolate_view(scene_idx, img_idx_0, img_idx_1)
     else:
         raise ValueError(f"Wrong '--mode': {args.mode}")

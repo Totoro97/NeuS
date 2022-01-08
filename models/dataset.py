@@ -357,7 +357,7 @@ class Dataset(torch.utils.data.Dataset):
 
         near, far = self.near_far_from_sphere(rays_o, rays_v)
 
-        return rays_o, rays_v, near, far
+        return rays_o, rays_v, near, far, pose
 
     def near_far_from_sphere(self, rays_o, rays_d):
         a = torch.sum(rays_d**2, dim=-1, keepdim=True)
