@@ -144,8 +144,12 @@ class Runner:
         self.finetune = self.conf.get_bool('train.finetune', default=False)
         self.train_scenewise_layers_only = \
             self.conf.get_bool('train.train_scenewise_layers_only', default=False)
+        parts_to_train = \
+            self.conf.get_list('train.parts_to_train', default=[])
         load_optimizer = \
             self.conf.get_bool('train.load_optimizer', default=not self.finetune)
+        parts_to_skip_loading = \
+            self.conf.get_list('train.parts_to_skip_loading', default=[])
 
         if self.finetune:
             assert self.dataset.num_scenes == 1, "Can only finetune to one scene"
@@ -165,13 +169,33 @@ class Runner:
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
 
-        def get_optimizer(scenewise_layers_only=False):
+        def get_optimizer(parts_to_train, which_layers='all'):
+            """
+            parts_to_train:
+                list of str
+                If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
+            which_layers:
+                str
+                One of: 'all', 'scenewise', 'shared'.
+            """
+            if parts_to_train == []:
+                parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
+            else:
+                logging.warning(f"Will optimize only these parts: {parts_to_train}")
+
             params_to_train = []
-            params_to_train += list(self.nerf_outside.parameters(scenewise_layers_only))
-            params_to_train += list(self.sdf_network.parameters(scenewise_layers_only))
-            params_to_train += list(self.deviation_network.parameters())
-            params_to_train += list(self.color_network.parameters(scenewise_layers_only))
-            logging.info(f"Got {len(params_to_train)} trainable tensors")
+            if 'nerf_outside' in parts_to_train:
+                params_to_train += list(self.nerf_outside.parameters(which_layers))
+            if 'sdf' in parts_to_train:
+                params_to_train += list(self.sdf_network.parameters(which_layers))
+            if 'deviation' in parts_to_train:
+                params_to_train += list(self.deviation_network.parameters())
+            if 'color' in parts_to_train:
+                params_to_train += list(self.color_network.parameters(which_layers))
+
+            logging.info(
+                f"Got {len(params_to_train)} trainable tensors " \
+                f"({sum(x.numel() for x in params_to_train)} parameters total)")
 
             return torch.optim.Adam(params_to_train, lr=1e10)
 
@@ -182,10 +206,10 @@ class Runner:
                                      **self.conf['model.neus_renderer'])
 
         if load_optimizer:
-            self.optimizer = get_optimizer()
+            self.optimizer = get_optimizer(parts_to_train, self.train_scenewise_layers_only)
 
         if checkpoint_path is not None:
-            self.load_checkpoint(checkpoint, load_optimizer)
+            self.load_checkpoint(checkpoint, parts_to_skip_loading, load_optimizer)
 
         if self.iter_step is None:
             self.iter_step = 0
@@ -196,7 +220,7 @@ class Runner:
             self.nerf_outside.switch_to_finetuning()
 
         if not load_optimizer:
-            self.optimizer = get_optimizer(self.train_scenewise_layers_only)
+            self.optimizer = get_optimizer(parts_to_train, self.train_scenewise_layers_only)
 
         # In case of finetuning
         self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes
@@ -335,7 +359,9 @@ class Runner:
 
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
-    def load_checkpoint(self, checkpoint: dict, load_optimizer: bool = True):
+    def load_checkpoint(self,
+        checkpoint: dict, parts_to_skip_loading: list[str] = [], load_optimizer: bool = True):
+
         def load_weights(module, state_dict):
             # backward compatibility:
             # replace 'lin(0-9)' (old convention) with 'linear_layers.' (new convention)
@@ -355,10 +381,18 @@ class Runner:
             # if unexpected_keys:
             #     logging.warning(f"Ignoring unexpected keys in checkpoint: {unexpected_keys}")
 
-        load_weights(self.nerf_outside, checkpoint['nerf'])
-        load_weights(self.sdf_network, checkpoint['sdf_network_fine'])
-        load_weights(self.deviation_network, checkpoint['variance_network_fine'])
-        load_weights(self.color_network, checkpoint['color_network_fine'])
+        if parts_to_skip_loading != []:
+            logging.warning(f"Not loading weights for {parts_to_skip_loading}")
+
+        if 'nerf_outside' not in parts_to_skip_loading:
+            load_weights(self.nerf_outside, checkpoint['nerf'])
+        if 'sdf' not in parts_to_skip_loading:
+            load_weights(self.sdf_network, checkpoint['sdf_network_fine'])
+        if 'deviation' not in parts_to_skip_loading:
+            load_weights(self.deviation_network, checkpoint['variance_network_fine'])
+        if 'color' not in parts_to_skip_loading:
+            load_weights(self.color_network, checkpoint['color_network_fine'])
+
         if load_optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
 
@@ -382,7 +416,7 @@ class Runner:
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', f'ckpt_{self.iter_step:07d}.pth'))
 
     def validate_images(self, resolution_level=None):
-        print('Validation. Iter: {}'.format(self.iter_step))
+        logging.info('Validation. Iter: {}'.format(self.iter_step))
 
         if resolution_level is None:
             resolution_level = self.validate_resolution_level

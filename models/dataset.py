@@ -86,33 +86,37 @@ class Dataset(torch.utils.data.Dataset):
 
         # Transpose the above list into
         # [["00747", "00889"], [], ["00053"], ...]
-        images_to_pick_per_scene = [[] for _ in range(self.num_scenes)]
-        if images_to_pick_all is not None:
+        if images_to_pick_all is None:
+            images_to_pick_per_scene = ['default' for _ in range(self.num_scenes)]
+        else:
+            images_to_pick_per_scene = [[] for _ in range(self.num_scenes)]
             for scene_idx, image_names in images_to_pick_all:
                 images_to_pick_per_scene[scene_idx] += image_names
 
         render_cameras_name = conf.get_string('render_cameras_name')
 
         def load_one_scene(
-            root_dir: pathlib.Path, images_to_pick: list[str] = [], kind: str = 'train'):
+            root_dir: pathlib.Path, images_to_pick: list[str] = 'default', kind: str = 'train'):
             """
             images_to_pick
                 list of str
                 Names of image files (without extension) to keep.
-                If empty, behaviour is controlled by `kind`.
+                If 'default', behaviour is controlled by `kind`.
             kind
                 str
                 Defines behavior when `images_to_pick` is empty.
                 If 'train', will load all images in the folder.
                 If 'val', will load the first and the last one (in the sorted list of filenames).
             """
+            if images_to_pick == []:
+                return tuple([] for _ in range(7))
+
             root_dir = pathlib.Path(root_dir)
 
             # Load images
             images_list = sorted(x for x in (root_dir / "image").iterdir() if x.suffix == '.png')
 
-            # If not specified, load all images
-            if images_to_pick == []:
+            if images_to_pick == 'default':
                 images_to_pick = [x.with_suffix('').name for x in images_list]
                 if kind == 'val':
                     if len(images_list) >= 2:
@@ -162,19 +166,20 @@ class Dataset(torch.utils.data.Dataset):
 
             return images, masks, pose_all, intrinsics_all, scale_mats_np, focal, obj_bboxes
 
-        all_data = [load_one_scene(data_dir, images_to_pick) \
+        all_data = [load_one_scene(data_dir, images_to_pick, kind=kind) \
             for data_dir, images_to_pick in zip(tqdm(self.data_dirs), images_to_pick_per_scene)]
         # Transpose
         self.images, self.masks, self.pose_all, self.intrinsics_all, \
             self.scale_mats_np, self.focal, self.object_bboxes = zip(*all_data)
 
-        self.pose_all = [x.to(self.device) for x in self.pose_all]
-        self.intrinsics_all = [x.to(self.device) for x in self.intrinsics_all]
-        self.intrinsics_all_inv = [torch.inverse(x) for x in self.intrinsics_all]
+        self.pose_all = [x.to(self.device) if x != [] else [] for x in self.pose_all]
+        self.intrinsics_all = [x.to(self.device) if x != [] else [] for x in self.intrinsics_all]
+        self.intrinsics_all_inv = [torch.inverse(x) if x != [] else [] for x in self.intrinsics_all]
 
-        self.H, self.W = self.images[0].shape[1:3]
+        self.H, self.W = next(filter(lambda x: x != [], self.images)).shape[1:3]
         self.image_pixels = self.H * self.W
-        if not all(images.shape[1:3] == (self.H, self.W) for images in self.images):
+        if not all(
+            images.shape[1:3] == (self.H, self.W) for images in self.images if images != []):
             raise NotImplementedError("Images of different sizes not supported yet")
 
         # Region of interest to **extract mesh**
