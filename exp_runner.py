@@ -132,18 +132,19 @@ class Runner:
         self.learning_rate_reduce_steps = \
             [int(x) for x in self.conf.get_list('train.learning_rate_reduce_steps')]
         self.learning_rate_reduce_factor = self.conf.get_float('train.learning_rate_reduce_factor')
-        self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
+        self.scenewise_layers_optimizer_extra_args = \
+            dict(self.conf.get('train.scenewise_layers_optimizer_extra_args'))
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
         self.iter_step = None if self.restart_from_iter is None else self.restart_from_iter
 
+        self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
+
         if 'train.restart_from_iter' in self.conf:
             del self.conf['train']['restart_from_iter'] # for proper checkpoint auto-restarts
 
         self.finetune = self.conf.get_bool('train.finetune', default=False)
-        self.train_scenewise_layers_only = \
-            self.conf.get_bool('train.train_scenewise_layers_only', default=False)
         parts_to_train = \
             self.conf.get_list('train.parts_to_train', default=[])
         load_optimizer = \
@@ -169,35 +170,45 @@ class Runner:
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network'], n_scenes=current_num_scenes).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
 
-        def get_optimizer(parts_to_train, which_layers='all'):
+        def get_optimizer(parts_to_train):
             """
             parts_to_train:
                 list of str
                 If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
-            which_layers:
-                str
-                One of: 'all', 'scenewise', 'shared'.
             """
             if parts_to_train == []:
                 parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
             else:
                 logging.warning(f"Will optimize only these parts: {parts_to_train}")
 
-            params_to_train = []
-            if 'nerf_outside' in parts_to_train:
-                params_to_train += list(self.nerf_outside.parameters(which_layers))
-            if 'sdf' in parts_to_train:
-                params_to_train += list(self.sdf_network.parameters(which_layers))
-            if 'deviation' in parts_to_train:
-                params_to_train += list(self.deviation_network.parameters())
-            if 'color' in parts_to_train:
-                params_to_train += list(self.color_network.parameters(which_layers))
+            parameter_group_names = ('shared', 'scenewise')
+            parameter_groups = []
 
-            logging.info(
-                f"Got {len(params_to_train)} trainable tensors " \
-                f"({sum(x.numel() for x in params_to_train)} parameters total)")
+            for which_layers in parameter_group_names:
+                tensors_to_train = []
+                if 'nerf_outside' in parts_to_train:
+                    tensors_to_train += list(self.nerf_outside.parameters(which_layers))
+                if 'sdf' in parts_to_train:
+                    tensors_to_train += list(self.sdf_network.parameters(which_layers))
+                if 'deviation' in parts_to_train:
+                    tensors_to_train += list(self.deviation_network.parameters(which_layers))
+                if 'color' in parts_to_train:
+                    tensors_to_train += list(self.color_network.parameters(which_layers))
 
-            return torch.optim.Adam(params_to_train, lr=1e10)
+                logging.info(
+                    f"Got {len(tensors_to_train)} trainable {which_layers} tensors " \
+                    f"({sum(x.numel() for x in tensors_to_train)} parameters total)")
+
+                parameter_group_settings = {
+                    'params': tensors_to_train,
+                    'base_learning_rate': self.base_learning_rate}
+
+                if which_layers == 'scenewise':
+                    parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
+
+                parameter_groups.append(parameter_group_settings)
+
+            return torch.optim.Adam(parameter_groups)
 
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
@@ -206,7 +217,7 @@ class Runner:
                                      **self.conf['model.neus_renderer'])
 
         if load_optimizer:
-            self.optimizer = get_optimizer(parts_to_train, self.train_scenewise_layers_only)
+            self.optimizer = get_optimizer(parts_to_train)
 
         if checkpoint_path is not None:
             self.load_checkpoint(checkpoint, parts_to_skip_loading, load_optimizer)
@@ -220,7 +231,7 @@ class Runner:
             self.nerf_outside.switch_to_finetuning()
 
         if not load_optimizer:
-            self.optimizer = get_optimizer(parts_to_train, self.train_scenewise_layers_only)
+            self.optimizer = get_optimizer(parts_to_train)
 
         # In case of finetuning
         self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes
@@ -327,24 +338,23 @@ class Runner:
 
     def update_learning_rate(self):
         if self.iter_step < self.warm_up_end:
-            learning_factor = \
+            learning_rate_factor = \
                 (self.iter_step - (self.restart_from_iter or 0)) / \
                 (self.warm_up_end - (self.restart_from_iter or 0))
         else:
             alpha = self.learning_rate_alpha
             progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end)
-            learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
-
-        learning_rate = self.base_learning_rate * learning_factor
+            learning_rate_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
         for reduce_step in self.learning_rate_reduce_steps:
             if self.iter_step >= reduce_step:
-                learning_rate *= self.learning_rate_reduce_factor
+                learning_rate_factor *= self.learning_rate_reduce_factor
 
         for g in self.optimizer.param_groups:
-            g['lr'] = learning_rate
+            g['lr'] = learning_rate_factor * g['base_learning_rate']
+            learning_rate_for_logging = g['lr']
 
-        return learning_rate
+        return learning_rate_for_logging
 
     def file_backup(self):
         dir_lis = self.conf['general.recording']

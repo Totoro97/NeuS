@@ -185,7 +185,9 @@ class SDFNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, scenewise_layers_only=False):
+    def parameters(self, which_layers='all'):
+        """which_layers: 'all'/'scenewise'/'shared'
+        """
         def is_scene_specific(name: str):
             name = name.split('.')
 
@@ -194,10 +196,19 @@ class SDFNetwork(nn.Module):
             except IndexError:
                 return False
 
-        if scenewise_layers_only:
-            return (x for name, x in super().named_parameters() if is_scene_specific(name))
+        scenewise_parameters = \
+            [x for name, x in super().named_parameters() if is_scene_specific(name)]
+        shared_parameters = \
+            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+
+        if which_layers == 'all':
+            return scenewise_parameters + shared_parameters
+        elif which_layers == 'scenewise':
+            return scenewise_parameters
+        elif which_layers == 'shared':
+            return shared_parameters
         else:
-            return super().parameters()
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
@@ -330,7 +341,9 @@ class RenderingNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, scenewise_layers_only=False):
+    def parameters(self, which_layers='all'):
+        """which_layers: 'all'/'scenewise'/'shared'
+        """
         def is_scene_specific(name: str):
             name = name.split('.')
 
@@ -339,10 +352,20 @@ class RenderingNetwork(nn.Module):
             except IndexError:
                 return False
 
-        if scenewise_layers_only:
-            return (x for name, x in super().named_parameters() if is_scene_specific(name))
+        scenewise_parameters = \
+            [x for name, x in super().named_parameters() if is_scene_specific(name)]
+        shared_parameters = \
+            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
+
+        if which_layers == 'all':
+            return scenewise_parameters + shared_parameters
+        elif which_layers == 'scenewise':
+            return scenewise_parameters
+        elif which_layers == 'shared':
+            return shared_parameters
         else:
-            return super().parameters()
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")
+
 
 # This implementation is borrowed from nerf-pytorch: https://github.com/yenchenlin/nerf-pytorch
 class NeRF(nn.Module):
@@ -444,8 +467,16 @@ class MultiSceneNeRF(nn.ModuleList):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, scenewise_layers_only=False):
-        return super().parameters()
+    def parameters(self, which_layers='all'):
+        """which_layers: 'all'/'scenewise'/'shared'
+        """
+        if which_layers in ('all', 'scenewise'):
+            return super().parameters()
+        elif which_layers == 'shared':
+            return []
+        else:
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")
+
 
 class SingleVarianceNetwork(nn.Module):
     def __init__(self, init_val):
@@ -454,3 +485,13 @@ class SingleVarianceNetwork(nn.Module):
 
     def forward(self, x):
         return torch.ones([len(x), 1], device=x.device) * torch.exp(self.variance * 10.0)
+
+    def parameters(self, which_layers='all'):
+        """which_layers: 'all'/'scenewise'/'shared'
+        """
+        if which_layers in ('all', 'shared'):
+            return super().parameters()
+        elif which_layers == 'scenewise':
+            return []
+        else:
+            raise ValueError(f"Wrong 'which_layers': {which_layers}")

@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name gonzalo_multi_skip_noVD
+#SBATCH --job-name gonzalo_multi_skip_noVD_scenewiseLr10
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 2-0
+#SBATCH --time 1-0
 
-#SBATCH -p gpu
+#SBATCH -p gpu_a100
 #SBATCH --gres gpu:1
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 15G
