@@ -91,7 +91,10 @@ class Dataset(torch.utils.data.Dataset):
         else:
             images_to_pick_per_scene = [[] for _ in range(self.num_scenes)]
             for scene_idx, image_names in images_to_pick_all:
-                images_to_pick_per_scene[scene_idx] += image_names
+                if type(image_names) is str:
+                    images_to_pick_per_scene[scene_idx] = image_names
+                else:
+                    images_to_pick_per_scene[scene_idx] += image_names
 
         render_cameras_name = conf.get_string('render_cameras_name')
 

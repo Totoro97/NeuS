@@ -133,7 +133,7 @@ class Runner:
             [int(x) for x in self.conf.get_list('train.learning_rate_reduce_steps')]
         self.learning_rate_reduce_factor = self.conf.get_float('train.learning_rate_reduce_factor')
         self.scenewise_layers_optimizer_extra_args = \
-            dict(self.conf.get('train.scenewise_layers_optimizer_extra_args'))
+            dict(self.conf.get('train.scenewise_layers_optimizer_extra_args', default={}))
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
@@ -184,29 +184,36 @@ class Runner:
             parameter_group_names = ('shared', 'scenewise')
             parameter_groups = []
 
+            if self.scenewise_layers_optimizer_extra_args:
+                logging.warning(f"Will not apply 'scenewise_layers_optimizer_extra_args' to bkgd NeRF")
+
             for which_layers in parameter_group_names:
-                tensors_to_train = []
-                if 'nerf_outside' in parts_to_train:
-                    tensors_to_train += list(self.nerf_outside.parameters(which_layers))
-                if 'sdf' in parts_to_train:
-                    tensors_to_train += list(self.sdf_network.parameters(which_layers))
-                if 'deviation' in parts_to_train:
-                    tensors_to_train += list(self.deviation_network.parameters(which_layers))
-                if 'color' in parts_to_train:
-                    tensors_to_train += list(self.color_network.parameters(which_layers))
+                for part_name in parts_to_train:
+                    if part_name == 'nerf_outside':
+                        module_to_train = self.nerf_outside
+                    elif part_name == 'sdf':
+                        module_to_train = self.sdf_network
+                    elif part_name == 'deviation':
+                        module_to_train = self.deviation_network
+                    elif part_name == 'color':
+                        module_to_train = self.color_network
+                    else:
+                        raise ValueError(f"Unknown 'parts_to_train': {part_name}")
 
-                logging.info(
-                    f"Got {len(tensors_to_train)} trainable {which_layers} tensors " \
-                    f"({sum(x.numel() for x in tensors_to_train)} parameters total)")
+                    tensors_to_train = list(module_to_train.parameters(which_layers))
 
-                parameter_group_settings = {
-                    'params': tensors_to_train,
-                    'base_learning_rate': self.base_learning_rate}
+                    logging.info(
+                        f"Got {len(tensors_to_train)} trainable {which_layers} tensors in " \
+                        f"{part_name} ({sum(x.numel() for x in tensors_to_train)} parameters total)")
 
-                if which_layers == 'scenewise':
-                    parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
+                    parameter_group_settings = {
+                        'params': tensors_to_train,
+                        'base_learning_rate': self.base_learning_rate}
 
-                parameter_groups.append(parameter_group_settings)
+                    if which_layers == 'scenewise' and part_name != 'nerf_outside':
+                        parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
+
+                    parameter_groups.append(parameter_group_settings)
 
             return torch.optim.Adam(parameter_groups)
 
@@ -367,7 +374,8 @@ class Runner:
                 if f_name[-3:] == '.py':
                     copyfile(os.path.join(dir_name, f_name), os.path.join(cur_dir, f_name))
 
-        copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
+        if self.conf_path is not None:
+            copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
     def load_checkpoint(self,
         checkpoint: dict, parts_to_skip_loading: list[str] = [], load_optimizer: bool = True):
