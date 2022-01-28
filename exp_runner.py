@@ -9,7 +9,6 @@ import trimesh
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
 
@@ -137,7 +136,6 @@ class Runner:
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
-        self.iter_step = None if self.restart_from_iter is None else self.restart_from_iter
 
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
 
@@ -229,8 +227,9 @@ class Runner:
         if checkpoint_path is not None:
             self.load_checkpoint(checkpoint, parts_to_skip_loading, load_optimizer)
 
-        if self.iter_step is None:
-            self.iter_step = 0
+        if self.restart_from_iter is None:
+            self.restart_from_iter = 0
+        self.iter_step = self.restart_from_iter
 
         if self.finetune:
             self.sdf_network.switch_to_finetuning()
@@ -344,14 +343,14 @@ class Runner:
             return np.min([1.0, self.iter_step / self.anneal_end])
 
     def update_learning_rate(self):
-        if self.iter_step < self.warm_up_end:
-            learning_rate_factor = \
-                (self.iter_step - (self.restart_from_iter or 0)) / \
-                (self.warm_up_end - (self.restart_from_iter or 0))
-        else:
-            alpha = self.learning_rate_alpha
-            progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end)
-            learning_rate_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
+        learning_rate_factor = 1.0
+
+        if self.iter_step - self.restart_from_iter < self.warm_up_end:
+            learning_rate_factor *= (self.iter_step - self.restart_from_iter) / self.warm_up_end
+
+        alpha = self.learning_rate_alpha
+        progress = self.iter_step / self.end_iter
+        learning_rate_factor *= (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
         for reduce_step in self.learning_rate_reduce_steps:
             if self.iter_step >= reduce_step:
@@ -414,8 +413,8 @@ class Runner:
         if load_optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
 
-        if self.iter_step is None:
-            self.iter_step = checkpoint['iter_step']
+        if self.restart_from_iter is None:
+            self.restart_from_iter = checkpoint['iter_step']
 
         logging.info('End')
 
@@ -500,6 +499,13 @@ class Runner:
 
                 render_images.append(render_image)
                 normal_images.append(normal_image)
+
+        def pad(image, width):
+            return torch.nn.functional.pad(image, (0, 0, 0, width - image.shape[1]))
+
+        max_W = max(image.shape[1] for image in normal_images)
+        render_images = [pad(image, max_W * 2) for image in render_images]
+        normal_images = [pad(image, max_W)     for image in normal_images]
 
         render_images = cv2.cvtColor(torch.cat(render_images).numpy(), cv2.COLOR_BGR2RGB)
         normal_images = cv2.cvtColor(torch.cat(normal_images).numpy(), cv2.COLOR_BGR2RGB)

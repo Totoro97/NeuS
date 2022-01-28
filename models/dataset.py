@@ -143,6 +143,7 @@ class Dataset(torch.utils.data.Dataset):
             # [n_images, H, W, 3], uint8
             images = torch.stack(
                 [torch.from_numpy(cv.imread(str(im_name))) for im_name in images_list])
+            H, W = images.shape[1:3]
 
             masks_list = sorted(x for x in (root_dir / "mask").iterdir() if x.suffix == '.png')
             masks_list = [masks_list[i] for i in image_idxs_to_pick]
@@ -165,7 +166,16 @@ class Dataset(torch.utils.data.Dataset):
             # Load object bboxes
             with open(root_dir / "tabular_data.pkl", 'rb') as f:
                 obj_bboxes = pickle.load(f)['crop_rectangles']
-                obj_bboxes = [obj_bboxes[i][:4] for i in image_idxs_to_pick]
+
+                def process_object_bbox(bbox):
+                    l, t, r, b, _ = bbox
+                    l = max(l, 0)
+                    t = max(t, 0)
+                    r = min(r, W - 1)
+                    b = min(b, H - 1)
+                    return l, t, r, b
+
+                obj_bboxes = [process_object_bbox(obj_bboxes[i]) for i in image_idxs_to_pick]
 
             return images, masks, pose_all, intrinsics_all, scale_mats_np, focal, obj_bboxes
 
@@ -197,16 +207,18 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         return i, self.gen_random_rays_at(self.batch_size, i)
 
-    def get_image_and_mask(self, scene_idx, image_idx, resolution_level=1):
+    def get_image_and_mask(self, scene_idx, image_idx, resolution_level=1, crop=None):
         # Using nearest neighbors because it's not Mip-NeRF yet
-        def resize_and_convert(image, scale):
-            image = cv.resize(
-                image, dsize=None, fx=scale, fy=scale, interpolation=cv.INTER_NEAREST)
+        def resize_and_convert(image, resolution_level):
+            if crop is not None:
+                l, t, r, b = crop
+                image = image[t:b+1, l:r+1]
+            image = image[::resolution_level, ::resolution_level]
+
             return torch.from_numpy(image.astype(np.float32) / 255.0)
 
-        scale = 1.0 / resolution_level
-        image = resize_and_convert(self.images[scene_idx][image_idx].numpy(), scale)
-        mask = resize_and_convert(self.masks[scene_idx][image_idx].numpy(), scale)[..., None]
+        image = resize_and_convert(self.images[scene_idx][image_idx].numpy(), resolution_level)
+        mask = resize_and_convert(self.masks[scene_idx][image_idx].numpy(), resolution_level)[..., None]
 
         return image, mask
 
@@ -253,17 +265,23 @@ class Dataset(torch.utils.data.Dataset):
         """
         Generate rays at world space from one camera.
         """
-        l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
+        l, t, r, b = self.object_bboxes[scene_idx][image_idx]
+        # Round to resolution_level grid
+        l -= l % resolution_level
+        t -= t % resolution_level
+        r -= r % resolution_level
+        b -= b % resolution_level
+
+        tx = torch.linspace(l, r, (r - l) // resolution_level + 1)
+        ty = torch.linspace(t, b, (b - t) // resolution_level + 1)
         pixels = torch.stack(torch.meshgrid(tx, ty), dim=-1)
 
         rays_o, rays_v = Dataset.gen_rays(
             pixels, self.pose_all[scene_idx][image_idx, :3, :4],
             self.intrinsics_all_inv[scene_idx][image_idx, :3, :3], self.H, self.W)
 
-        rgb, mask = self.get_image_and_mask(scene_idx, image_idx, resolution_level)
-
+        rgb, mask = self.get_image_and_mask(
+            scene_idx, image_idx, resolution_level, crop=[l, t, r, b])
         rays_o = rays_o.transpose(0, 1)
         rays_v = rays_v.transpose(0, 1)
         near, far = self.near_far_from_sphere(rays_o, rays_v)
@@ -304,9 +322,9 @@ class Dataset(torch.utils.data.Dataset):
             remaining_rays_to_sample -= current_rays_to_sample
 
             current_pixels_x = torch.randint(
-                low=max(0, l-1), high=min(self.W, r+1), size=[current_rays_to_sample])
+                low=l, high=r, size=[current_rays_to_sample])
             current_pixels_y = torch.randint(
-                low=max(0, t-1), high=min(self.H, b+1), size=[current_rays_to_sample])
+                low=t, high=b, size=[current_rays_to_sample])
 
             rgb = rgb[(current_pixels_y, current_pixels_x)]    # batch_size, 3
             mask = mask[(current_pixels_y, current_pixels_x)]  # batch_size, 1
