@@ -204,7 +204,7 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper):
     # Decode video. Filter and resave frames to a temporary folder
     decode_video(video_path, images_output_path, images_preview_path, frames_to_keep)
 
-    # Clean the point cloud (manually for now)
+    # Clean the dataset (manually for now)
     logger.info(
         f"Now please manually remove blinks from 'images-original' (smaller size in " \
         f"'images-preview' for your convenience) and press Enter")
@@ -391,7 +391,8 @@ def select_few_frames(
     # Leave only about `final_num_frames` (e.g. 75) frames uniformly
     frames_remaining = sum(frames_to_keep)
     assert frames_remaining > final_num_frames, \
-        f"Too few ({frames_remaining}) video frames, please debug this"
+        f"Too few video frames ({frames_remaining} but need "
+        f"{sum(frames_to_keep)}), please debug this"
 
     surviving_frame_idx = 0 # counts how many frames with `frames_to_keep[i] == True` we met
     for i in range(first_n_frames_to_skip, len(all_timestamps)):

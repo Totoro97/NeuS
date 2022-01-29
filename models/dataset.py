@@ -127,6 +127,9 @@ class Dataset(torch.utils.data.Dataset):
                 else:
                     assert kind == 'train', f"Wrong 'kind': '{kind}'"
 
+            # In the "images to pick" config list, convert image names to indices in the
+            # sorted list. We need this to correctly pick the corresponding camera parameters
+            # (the camera params array is just a list of tensors without names).
             def get_image_idx(image_file_name):
                 try:
                     return [i for i, x in enumerate(images_list) if x.with_suffix('').name == image_file_name][0]
