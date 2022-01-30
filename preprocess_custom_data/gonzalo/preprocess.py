@@ -59,7 +59,7 @@ class ImageCropper:
             face_alignment.LandmarksType._3D, flip_input=False)
 
     @staticmethod
-    def choose_one_detection(frame_faces):
+    def choose_one_detection(frame_faces, image_width):
         """
         frame_faces
             list of lists of length 5
@@ -74,18 +74,26 @@ class ImageCropper:
 
         if len(frame_faces) == 0:
             raise ImageCropper.BlinkException
-        elif len(frame_faces) == 1:
-            return 0
         else:
-            # sort by area, find the largest box
-            largest_area, largest_idx = -1, -1
-            for idx, face in enumerate(frame_faces):
-                area = abs(face[2]-face[0]) * abs(face[1]-face[3])
-                if area > largest_area:
-                    largest_area = area
-                    largest_idx = idx
+            # # sort by area, find the largest box
+            # largest_area, largest_idx = -1, -1
+            # for idx, face in enumerate(frame_faces):
+            #     area = abs(face[2]-face[0]) * abs(face[1]-face[3])
+            #     if area > largest_area:
+            #         largest_area = area
+            #         largest_idx = idx
 
-            return largest_idx
+            # return largest_idx
+
+            # find the box closest to center
+            min_distance_to_center, closest_to_center_idx = 1e9, -1
+            for idx, face in enumerate(frame_faces):
+                distance_to_center = abs(image_width * 0.5 - (face[0] + face[2]) / 2)
+                if distance_to_center < min_distance_to_center:
+                    min_distance_to_center = distance_to_center
+                    closest_to_center_idx = idx
+
+            return closest_to_center_idx
 
     def crop_to_face(self, image):
         """
@@ -130,7 +138,7 @@ class ImageCropper:
         landmarks_list, _, face_rects = self.landmark_detector.get_landmarks_from_image(
             cv2.cvtColor(image, cv2.COLOR_BGR2RGB), return_bboxes=True)
 
-        best_face_rect_idx = self.choose_one_detection(face_rects)
+        best_face_rect_idx = self.choose_one_detection(face_rects, image_width=image.shape[1])
         landmarks = landmarks_list[best_face_rect_idx].tolist()
         face_rect = face_rects[best_face_rect_idx].tolist()
 
@@ -215,13 +223,12 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper):
 
     # LLFF's imgs2poses needs 'images'
     symlink_for_colmap = output_path / "images"
-    symlink_for_colmap.symlink_to(images_output_path.name, target_is_directory=True)
-
+    if not symlink_for_colmap.is_dir():
+        symlink_for_colmap.symlink_to(images_output_path.name, target_is_directory=True)
     sys.path.insert(1, "../colmap_preprocess")
     from pose_utils import gen_poses as llff_gen_poses
     # Generates 'poses.npy', 'sparse/0', 'sparse_points.ply'
     llff_gen_poses(output_path, 'exhaustive_matcher')
-
     IS_REFERENCE_SCENE = False
     if IS_REFERENCE_SCENE:
         logger.info(
@@ -391,7 +398,7 @@ def select_few_frames(
     # Leave only about `final_num_frames` (e.g. 75) frames uniformly
     frames_remaining = sum(frames_to_keep)
     assert frames_remaining > final_num_frames, \
-        f"Too few video frames ({frames_remaining} but need "
+        f"Too few video frames ({frames_remaining} but need " \
         f"{sum(frames_to_keep)}), please debug this"
 
     surviving_frame_idx = 0 # counts how many frames with `frames_to_keep[i] == True` we met
