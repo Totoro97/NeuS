@@ -4,11 +4,11 @@ from models.renderer import NeuSRenderer
 
 import cv2
 import numpy as np
-import cv2 as cv
 import trimesh
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+import apex
 from tqdm import tqdm
 from pyhocon import ConfigFactory, ConfigTree
 
@@ -174,46 +174,100 @@ class Runner:
                 list of str
                 If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
             """
+            class ScenePickingAdam(apex.optimizers.FusedAdam):
+                def step(self, closure=None, scene_idx: int = None):
+                    # Only retain SHARED and SCENEWISE-`scene_idx` param groups, remove the rest
+                    def should_pick_param_group(param_group):
+                        name = param_group['group_name'].split('-')
+                        if name[1] == 'SHARED':
+                            return True
+                        elif name[1] == 'SCENEWISE':
+                            return int(name[2]) == scene_idx
+                        else:
+                            raise ValueError(f"Wrong group name: {name}")
+
+                    all_param_groups = self.param_groups
+                    picked_param_groups = \
+                        [x for x in self.param_groups if should_pick_param_group(x)]
+
+                    try:
+                        self.param_groups = picked_param_groups
+                        return super().step(closure)
+                    finally:
+                        self.param_groups = all_param_groups
+
             if parts_to_train == []:
                 parts_to_train = ['nerf_outside', 'sdf', 'deviation', 'color']
             else:
                 logging.warning(f"Will optimize only these parts: {parts_to_train}")
 
-            parameter_group_names = ('shared', 'scenewise')
+            if self.scenewise_layers_optimizer_extra_args:
+                logging.warning(
+                    f"There are 'scenewise_layers_optimizer_extra_args'. " \
+                    f"Will not apply them to bkgd NeRF: " \
+                    f"{self.scenewise_layers_optimizer_extra_args}")
+
+            def get_module_to_train(part_name):
+                if part_name == 'nerf_outside':
+                    return self.nerf_outside
+                elif part_name == 'sdf':
+                    return self.sdf_network
+                elif part_name == 'deviation':
+                    return self.deviation_network
+                elif part_name == 'color':
+                    return self.color_network
+                else:
+                    raise ValueError(f"Unknown 'parts_to_train': {part_name}")
+
             parameter_groups = []
 
-            if self.scenewise_layers_optimizer_extra_args:
-                logging.warning(f"Will not apply 'scenewise_layers_optimizer_extra_args' to bkgd NeRF")
+            # Get optimizer groups for parameters that are SHARED between scenes
+            total_tensors, total_parameters = 0, 0
+            for part_name in parts_to_train:
+                module_to_train = get_module_to_train(part_name)
+                tensors_to_train = list(module_to_train.parameters('shared'))
 
-            for which_layers in parameter_group_names:
-                for part_name in parts_to_train:
-                    if part_name == 'nerf_outside':
-                        module_to_train = self.nerf_outside
-                    elif part_name == 'sdf':
-                        module_to_train = self.sdf_network
-                    elif part_name == 'deviation':
-                        module_to_train = self.deviation_network
-                    elif part_name == 'color':
-                        module_to_train = self.color_network
-                    else:
-                        raise ValueError(f"Unknown 'parts_to_train': {part_name}")
+                total_tensors += len(tensors_to_train)
+                total_parameters += sum(x.numel() for x in tensors_to_train)
 
-                    tensors_to_train = list(module_to_train.parameters(which_layers))
+                parameter_group_settings = {
+                    'group_name': f'{part_name}-SHARED',
+                    'params': tensors_to_train,
+                    'base_learning_rate': self.base_learning_rate}
 
-                    logging.info(
-                        f"Got {len(tensors_to_train)} trainable {which_layers} tensors in " \
-                        f"{part_name} ({sum(x.numel() for x in tensors_to_train)} parameters total)")
+                parameter_groups.append(parameter_group_settings)
+
+            logging.info(
+                f"Got {total_tensors} trainable SHARED tensors " \
+                f" ({total_parameters} parameters total)")
+
+            # Get optimizer groups for parameters that correspond to only ONE scene
+            total_tensors, total_parameters = 0, 0
+            for part_name in parts_to_train:
+                module_to_train = get_module_to_train(part_name)
+
+                num_scenes_in_model = len(self.nerf_outside)
+                for scene_idx in range(num_scenes_in_model):
+                    tensors_to_train = list(module_to_train.parameters('scenewise', scene_idx))
+
+                    total_tensors += len(tensors_to_train)
+                    total_parameters += sum(x.numel() for x in tensors_to_train)
 
                     parameter_group_settings = {
+                        'group_name': f'{part_name}-SCENEWISE-{scene_idx}',
                         'params': tensors_to_train,
                         'base_learning_rate': self.base_learning_rate}
 
-                    if which_layers == 'scenewise' and part_name != 'nerf_outside':
+                    if part_name != 'nerf_outside':
                         parameter_group_settings.update(self.scenewise_layers_optimizer_extra_args)
 
                     parameter_groups.append(parameter_group_settings)
 
-            return torch.optim.Adam(parameter_groups)
+            logging.info(
+                f"Got {total_tensors} trainable SCENEWISE tensors " \
+                f" ({total_parameters} parameters total)")
+
+            return ScenePickingAdam(parameter_groups)
 
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
@@ -251,6 +305,7 @@ class Runner:
         res_step = self.end_iter - self.iter_step
 
         data_loader = iter(self.dataset.get_dataloader())
+        logging.info("Starting training")
 
         for iter_i in tqdm(range(res_step)):
             start_time = time.time()
@@ -306,7 +361,7 @@ class Runner:
             learning_rate = self.update_learning_rate() # the value is only needed for logging
             self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
+            self.optimizer.step(scene_idx=scene_idx)
 
             step_time = time.time() - start_time
 
@@ -594,11 +649,11 @@ class Runner:
         for i in range(n_frames):
             images.append(images[n_frames - i - 1])
 
-        fourcc = cv.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_dir = os.path.join(self.base_exp_dir, 'render')
         os.makedirs(video_dir, exist_ok=True)
         h, w, _ = images[0].shape
-        writer = cv.VideoWriter(
+        writer = cv2.VideoWriter(
             os.path.join(
                 video_dir,
                 f"{self.iter_step:0>8d}_scene{scene_idx:03d}_{img_idx_0}_{img_idx_1}.mp4"),

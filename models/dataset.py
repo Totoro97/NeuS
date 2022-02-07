@@ -303,7 +303,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # Determine which images to use
         if image_idx is None:
-            NUM_IMAGES_TO_USE = 5
+            NUM_IMAGES_TO_USE = 8
             num_images_in_scene = len(self.images[scene_idx])
             num_images_to_use = min(NUM_IMAGES_TO_USE, num_images_in_scene)
 

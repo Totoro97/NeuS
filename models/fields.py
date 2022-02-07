@@ -185,28 +185,34 @@ class SDFNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, which_layers='all'):
+    def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str):
+        def is_scene_specific(name: str, scene_idx: int = None):
+            """
+            Is layer with this name both
+                1. scene-specific;
+                2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
+            """
             name = name.split('.')
 
             try:
-                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+                retval = name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+                if retval and scene_idx is not None:
+                    retval &= int(name[2]) == scene_idx
+                return retval
             except IndexError:
                 return False
 
-        scenewise_parameters = \
-            [x for name, x in super().named_parameters() if is_scene_specific(name)]
-        shared_parameters = \
-            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
-
         if which_layers == 'all':
-            return scenewise_parameters + shared_parameters
+            assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
+            return list(super().parameters())
         elif which_layers == 'scenewise':
-            return scenewise_parameters
+            return \
+                [x for name, x in super().named_parameters() if is_scene_specific(name, scene_idx)]
         elif which_layers == 'shared':
-            return shared_parameters
+            return \
+                [x for name, x in super().named_parameters() if not is_scene_specific(name)]
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
@@ -341,28 +347,34 @@ class RenderingNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, which_layers='all'):
+    def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        def is_scene_specific(name: str):
+        def is_scene_specific(name: str, scene_idx: int = None):
+            """
+            Is layer with this name both
+                1. scene-specific;
+                2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
+            """
             name = name.split('.')
 
             try:
-                return name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+                retval = name[0] == 'linear_layers' and name[1].isdigit() and name[2].isdigit()
+                if retval and scene_idx is not None:
+                    retval &= int(name[2]) == scene_idx
+                return retval
             except IndexError:
                 return False
 
-        scenewise_parameters = \
-            [x for name, x in super().named_parameters() if is_scene_specific(name)]
-        shared_parameters = \
-            [x for name, x in super().named_parameters() if not is_scene_specific(name)]
-
         if which_layers == 'all':
-            return scenewise_parameters + shared_parameters
+            assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
+            return list(super().parameters())
         elif which_layers == 'scenewise':
-            return scenewise_parameters
+            return \
+                [x for name, x in super().named_parameters() if is_scene_specific(name, scene_idx)]
         elif which_layers == 'shared':
-            return shared_parameters
+            return \
+                [x for name, x in super().named_parameters() if not is_scene_specific(name)]
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
@@ -467,13 +479,19 @@ class MultiSceneNeRF(nn.ModuleList):
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
-    def parameters(self, which_layers='all'):
+    def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
-        if which_layers in ('all', 'scenewise'):
-            return super().parameters()
+        if which_layers == 'all':
+            assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
+            return list(super().parameters())
         elif which_layers == 'shared':
             return []
+        elif which_layers == 'scenewise':
+            if scene_idx is None:
+                return super().parameters()
+            else:
+                return list(self[scene_idx].parameters())
         else:
             raise ValueError(f"Wrong 'which_layers': {which_layers}")
 
@@ -486,11 +504,12 @@ class SingleVarianceNetwork(nn.Module):
     def forward(self, x):
         return torch.ones([len(x), 1], device=x.device) * torch.exp(self.variance * 10.0)
 
-    def parameters(self, which_layers='all'):
+    def parameters(self, which_layers='all', scene_idx=None):
         """which_layers: 'all'/'scenewise'/'shared'
         """
         if which_layers in ('all', 'shared'):
-            return super().parameters()
+            assert scene_idx is None, "which_layers='all' isn't supported with scene_idx != None"
+            return list(super().parameters())
         elif which_layers == 'scenewise':
             return []
         else:
