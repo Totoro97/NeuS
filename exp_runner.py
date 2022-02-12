@@ -19,7 +19,7 @@ import time
 import logging
 import argparse
 from shutil import copyfile
-
+import contextlib
 
 def psnr(color_fine, true_rgb, mask):
     assert mask.shape[:-1] == color_fine.shape[:-1] and mask.shape[-1] == 1
@@ -28,11 +28,13 @@ def psnr(color_fine, true_rgb, mask):
 
 
 class Runner:
-    def __init__(self,
-        conf_path: pathlib.Path, checkpoint_path: pathlib.Path = None,
-        extra_config_args: str = None, mode: str = 'train'):
+    def __init__(self, args):
+        self.rank = args.rank
+        self.world_size = args.world_size
 
-        self.device = torch.device('cuda')
+        conf_path = args.conf
+        checkpoint_path = args.checkpoint_path
+        self.device = args.device
 
         assert conf_path or checkpoint_path, "Specify at least config or checkpoint"
 
@@ -58,7 +60,7 @@ class Runner:
                     if type(source[key]) is ConfigTree:
                         update_config_tree(target[key], source[key], f'{current_prefix}{key}.')
                     else:
-                        if target[key] != source[key]:
+                        if target[key] != source[key] and self.rank == 0:
                             logging.info(
                                 f"Updating config value at '{current_prefix}{key}'. "
                                 f"Old: '{target[key]}', new: '{source[key]}'")
@@ -68,7 +70,7 @@ class Runner:
         # Load the config file, for now just to extract the checkpoint path from it
         self.conf_path = conf_path
         if conf_path is not None:
-            logging.info(f"Using config '{conf_path}'")
+            if self.rank == 0: logging.info(f"Using config '{conf_path}'")
             config_from_file = ConfigFactory.parse_file(conf_path)
 
             checkpoint_path_from_config = \
@@ -90,7 +92,7 @@ class Runner:
 
         # Load the checkpoint, for now just to extract config from there
         if checkpoint_path is not None:
-            logging.info(f"Loading checkpoint '{checkpoint_path}'")
+            if self.rank == 0: logging.info(f"Loading checkpoint '{checkpoint_path}'")
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
             if 'config' in checkpoint:
@@ -106,8 +108,8 @@ class Runner:
             update_config_tree(self.conf, config_from_file)
 
         # Finally, update config with extra command line args
-        if extra_config_args is not None:
-            update_config_tree(self.conf, ConfigFactory.parse_string(extra_config_args))
+        if args.extra_config_args is not None:
+            update_config_tree(self.conf, ConfigFactory.parse_string(args.extra_config_args))
 
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
@@ -137,6 +139,8 @@ class Runner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
         self.restart_from_iter = self.conf.get_int('train.restart_from_iter', default=None)
 
+        self.use_fp16 = self.conf.get_bool('train.use_fp16', default=False)
+
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
 
         if 'train.restart_from_iter' in self.conf:
@@ -157,7 +161,7 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
-        self.mode = mode
+        self.mode = args.mode
         self.model_list = []
         self.writer = None
 
@@ -175,8 +179,10 @@ class Runner:
                 If [], train all parts: 'nerf_outside', 'sdf', 'deviation', 'color'.
             """
             class ScenePickingAdam(apex.optimizers.FusedAdam):
-                def step(self, closure=None, scene_idx: int = None):
-                    # Only retain SHARED and SCENEWISE-`scene_idx` param groups, remove the rest
+                @contextlib.contextmanager
+                def limit_to_parameters_of_one_scene(self, scene_idx: int = None):
+                    # Only retain SHARED and SCENEWISE-`scene_idx` param groups, remove the rest.
+                    # If `scene_idx == None`, retain only SHARED parameters.
                     def should_pick_param_group(param_group):
                         name = param_group['group_name'].split('-')
                         if name[1] == 'SHARED':
@@ -192,7 +198,7 @@ class Runner:
 
                     try:
                         self.param_groups = picked_param_groups
-                        return super().step(closure)
+                        yield
                     finally:
                         self.param_groups = all_param_groups
 
@@ -275,6 +281,8 @@ class Runner:
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
 
+        self.gradient_scaler = torch.cuda.amp.GradScaler(enabled=self.use_fp16)
+
         if load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)
 
@@ -293,12 +301,32 @@ class Runner:
         if not load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)
 
+        # Synchronize parameters (process #0 sends weights to all other processes)
+        for network in self.sdf_network, self.color_network, \
+                       self.nerf_outside, self.deviation_network:
+            apex.parallel.Reducer(network)
+        # Initialize `self._shared_parameters` for `self.average_shared_gradients_between_GPUs()`
+        with self.optimizer.limit_to_parameters_of_one_scene(scene_idx=None):
+            self._shared_parameters = sum([x['params'] for x in self.optimizer.param_groups], [])
+
         # In case of finetuning
         self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes
 
         # Backup codes and configs for debug
-        if self.mode[:5] == 'train':
+        if self.mode[:5] == 'train' and self.rank == 0:
             self.file_backup()
+
+    # This is to average gradients of shared parameters after each iteration
+    def average_shared_gradients_between_GPUs(self):
+        gradients = [x.grad for x in self._shared_parameters if x.grad is not None]
+        with torch.no_grad():
+            apex.parallel.distributed.flat_dist_call(gradients, torch.distributed.all_reduce)
+
+    # This is to average model parameters between GPUs
+    def average_parameters_between_GPUs(self):
+        parameters = sum([x['params'] for x in self.optimizer.param_groups], [])
+        with torch.no_grad():
+            apex.parallel.distributed.flat_dist_call(parameters, torch.distributed.all_reduce)
 
     def train(self):
         self.writer = SummaryWriter(log_dir=self.base_exp_dir)
@@ -325,71 +353,81 @@ class Runner:
             if self.use_white_bkgd:
                 background_rgb = torch.ones([1, 3])
 
-            render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
-                                              background_rgb=background_rgb,
-                                              cos_anneal_ratio=self.get_cos_anneal_ratio())
+            with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                render_out = self.renderer.render(rays_o, rays_d, near, far, scene_idx,
+                                                  background_rgb=background_rgb,
+                                                  cos_anneal_ratio=self.get_cos_anneal_ratio())
 
-            color_fine = render_out['color_fine']
-            s_val = render_out['s_val']
-            cdf_fine = render_out['cdf_fine']
-            gradient_error = render_out['gradient_error']
-            weight_max = render_out['weight_max']
-            weight_sum = render_out['weight_sum']
+                color_fine = render_out['color_fine']
+                s_val = render_out['s_val']
+                cdf_fine = render_out['cdf_fine']
+                gradient_error = render_out['gradient_error']
+                weight_max = render_out['weight_max']
+                weight_sum = render_out['weight_sum']
 
-            # Loss
-            color_error = color_fine - true_rgb
-            if self.mask_weight > 0.0:
-                color_error *= mask
+                # Loss
+                color_error = color_fine - true_rgb
+                if self.mask_weight > 0.0:
+                    color_error *= mask
 
-            color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum')
-            if self.mask_weight > 0.0:
-                color_fine_loss /= mask_sum
-            else:
-                color_fine_loss /= color_error.numel()
+                color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum')
+                if self.mask_weight > 0.0:
+                    color_fine_loss /= mask_sum
+                else:
+                    color_fine_loss /= color_error.numel()
 
-            psnr_train = psnr(color_fine, true_rgb, mask)
+                psnr_train = psnr(color_fine, true_rgb, mask)
 
-            eikonal_loss = gradient_error
+                eikonal_loss = gradient_error
 
-            loss = color_fine_loss + \
-                   eikonal_loss * self.igr_weight
+                loss = color_fine_loss + \
+                       eikonal_loss * self.igr_weight
 
-            if self.mask_weight > 0.0:
-                mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
-                loss += mask_loss * self.mask_weight
+                if self.mask_weight > 0.0:
+                    mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+                    loss += mask_loss * self.mask_weight
 
             learning_rate = self.update_learning_rate() # the value is only needed for logging
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step(scene_idx=scene_idx)
+            self.gradient_scaler.scale(loss).backward()
+            self.average_shared_gradients_between_GPUs()
+            # TODO: create a separate scaler for every scene and for shared parameters
+            with self.optimizer.limit_to_parameters_of_one_scene(scene_idx=scene_idx):
+                self.gradient_scaler.step(self.optimizer)
+
+            self.gradient_scaler.update()
+
+            if iter_i % 100 == 0:
+                self.average_parameters_between_GPUs()
 
             step_time = time.time() - start_time
 
             with torch.no_grad():
                 self.iter_step += 1
 
-                self.writer.add_scalar('Loss/Total', loss, self.iter_step)
-                self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
-                self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
-                self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
-                self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-                self.writer.add_scalar('Statistics/Learning rate', learning_rate, self.iter_step)
-                self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
-                self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-                self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
+                if self.rank == 0:
+                    self.writer.add_scalar('Loss/Total', loss, self.iter_step)
+                    self.writer.add_scalar('Loss/L1', color_fine_loss, self.iter_step)
+                    self.writer.add_scalar('Loss/Eikonal', eikonal_loss, self.iter_step)
+                    self.writer.add_scalar('Loss/PSNR (train)', psnr_train, self.iter_step)
+                    self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+                    self.writer.add_scalar('Statistics/Learning rate', learning_rate, self.iter_step)
+                    self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
+                    self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+                    self.writer.add_scalar('Statistics/Step time', step_time, self.iter_step)
 
-                if self.iter_step % self.report_freq == 0:
-                    print(self.base_exp_dir)
-                    print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                    if self.iter_step % self.report_freq == 0:
+                        print(self.base_exp_dir)
+                        print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-                if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
-                    self.save_checkpoint()
+                    if self.iter_step % self.save_freq == 0 or self.iter_step == self.end_iter or self.iter_step == 1:
+                        self.save_checkpoint()
 
-                if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
-                    self.validate_images()
+                    if self.iter_step % self.val_freq == 0 or self.iter_step == 1:
+                        self.validate_images()
 
-                if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
-                    self.validate_mesh()
+                    if self.iter_step % self.val_mesh_freq == 0 or self.iter_step == self.end_iter:
+                        self.validate_mesh()
 
     def get_cos_anneal_ratio(self):
         if self.anneal_end == 0.0:
@@ -467,6 +505,11 @@ class Runner:
 
         if load_optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
+            if self.use_fp16:
+                if 'gradient_scaler' in checkpoint:
+                    self.gradient_scaler.load_state_dict(checkpoint['gradient_scaler'])
+                else:
+                    logging.warning(f"`use_fp16 == True`, but no `gradient_scaler` in checkpoint!")
 
         if self.restart_from_iter is None:
             self.restart_from_iter = checkpoint['iter_step']
@@ -483,6 +526,8 @@ class Runner:
             'iter_step': self.iter_step,
             'config': self.conf,
         }
+        if self.use_fp16:
+            checkpoint['gradient_scaler'] = self.gradient_scaler.state_dict()
 
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', f'ckpt_{self.iter_step:07d}.pth'))
@@ -664,13 +709,16 @@ class Runner:
 
         writer.release()
 
+def seed_RNGs(seed):
+    logging.info(f"Random Seed: {seed}")
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
 if __name__ == '__main__':
     print('Hello Wooden')
 
-    # torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
-    FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
+    FORMAT = "PID %(process)d - %(asctime)s - %(levelname)s - %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
 
     parser = argparse.ArgumentParser()
@@ -679,12 +727,23 @@ if __name__ == '__main__':
     parser.add_argument('--extra_config_args', type=str, default=None)
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
-    parser.add_argument('--gpu', type=int, default=0)
 
     args = parser.parse_args()
+    args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    args.rank = int(os.environ.get('RANK', 0))
+    args.num_gpus = args.world_size = int(os.environ.get('WORLD_SIZE', 1))
 
-    torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.checkpoint_path, args.extra_config_args, args.mode)
+    if args.rank > 0 and args.mode != 'train':
+        logger.warning(f"`--mode` != 'train', shutting all processes but one")
+
+    # Multi-GPU training
+    torch.cuda.set_device(args.local_rank)
+    args.device = f'cuda:{args.local_rank}'
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+    seed_RNGs(args.rank)
+
+    runner = Runner(args)
 
     if args.mode == 'train':
         runner.train()
