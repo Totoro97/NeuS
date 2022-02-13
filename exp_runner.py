@@ -308,6 +308,9 @@ class Runner:
         # Initialize `self._shared_parameters` for `self.average_shared_gradients_between_GPUs()`
         with self.optimizer.limit_to_parameters_of_one_scene(scene_idx=None):
             self._shared_parameters = sum([x['params'] for x in self.optimizer.param_groups], [])
+        logging.info(
+            f"There are {len(self._shared_parameters)} 'shared' parameters to average over GPUs " \
+            f"at each step")
 
         # In case of finetuning
         self.conf['dataset']['original_num_scenes'] = self.dataset.num_scenes

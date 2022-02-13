@@ -6,6 +6,86 @@ from models.embedder import get_embedder
 
 import logging
 
+class LowRankMultiLinear(nn.Module):
+    """N linear layers whose weights are linearly regressed at forward pass from smaller
+    matrices, leading to "lower rank" (lower DoF) parametrization.
+    """
+    def __init__(self, n_scenes, in_dim, out_dim, rank, weight_norm=False):
+        """
+        rank:
+            How many instances of weights (`P`) are learned.
+            The weights of all `n_scenes` layers will be computed as their linear combinations.
+        """
+        super().__init__()
+        assert rank > 0
+        if weight_norm:
+            raise NotImplementedError("weight_norm + low-rank Linear layers")
+
+        self.linear_layers = nn.ModuleList([nn.Linear(in_dim, out_dim) for _ in range(n_scenes)])
+
+        basis_weights = {}
+        for parameter_name, parameter in self.linear_layers[0].named_parameters():
+            basis_weights[parameter_name] = nn.Parameter(torch.empty(parameter.shape + (rank,)))
+
+        self.basis_weights = nn.ParameterDict(basis_weights) # 'weight': out_dim x in_dim x rank
+        self.combination_coeffs = nn.Parameter(torch.empty(n_scenes, rank)) # n_scenes x rank
+
+        # A an application of PyTorch 'parametrization' functionality
+        class LowRankWeight(nn.Module):
+            def __init__(self,
+                multi_linear_module: LowRankMultiLinear, parameter_name: str, scene_idx: int):
+                super().__init__()
+
+                # don't register, just store a reference
+                self.__dict__['multi_linear_module'] = multi_linear_module
+
+                self.parameter_name = parameter_name
+                self.scene_idx = scene_idx
+
+            def right_inverse(self, *args):
+                """By returning an empty tuple, this tells `register_parametrization()` that
+                we'll never need any of the original `Linear`'s parameters ('weight', 'bias').
+                """
+                return ()
+
+            def forward(self):
+                """No input args (module's parameters to be 'reparametrized') because we source
+                parameters only from external tensors (namely, from `self.multi_linear_module`).
+                This is ensured by `right_inverse()` having empty output.
+                """
+                # (rank)
+                combination_coeffs = self.multi_linear_module.combination_coeffs[self.scene_idx]
+                # (out_dim x in_dim x rank) - in case `parameter_name` is 'weight'
+                parameter_basis = self.multi_linear_module.basis_weights[self.parameter_name]
+                # (out_dim x in_dim)
+                return parameter_basis @ combination_coeffs
+
+        for parameter_name, _ in list(self.linear_layers[0].named_parameters()):
+            for scene_idx, layer in enumerate(self.linear_layers):
+                nn.utils.parametrize.register_parametrization(
+                    layer, parameter_name, LowRankWeight(self, parameter_name, scene_idx))
+
+        self.reset_parameters_()
+
+    def __getitem__(self, scene_idx):
+        return self.linear_layers[scene_idx]
+
+    def reset_parameters_(self):
+        _, in_dim, rank = self.basis_weights['weight'].shape
+
+        # Initialize weight
+        for i in range(rank):
+            # https://pytorch.org/docs/stable/_modules/torch/nn/modules/linear.html#Linear
+            nn.init.kaiming_uniform_(self.basis_weights['weight'][..., i], a=np.sqrt(5))
+
+        # Initialize bias
+        bound = 1 / np.sqrt(in_dim)
+        nn.init.uniform_(self.basis_weights['bias'], -bound, bound)
+
+        # Initialize linear combination coefficients
+        nn.init.kaiming_uniform_(self.combination_coeffs, nonlinearity='linear')
+
+
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
     def __init__(self,
@@ -15,6 +95,7 @@ class SDFNetwork(nn.Module):
                  n_layers,
                  n_scenes,
                  scenewise_split_type='interleave',
+                 scenewise_core_rank=None,
                  skip_in=(4,),
                  multires=0,
                  bias=0.5,
@@ -64,43 +145,16 @@ class SDFNetwork(nn.Module):
         total_scene_specific_layers = 0
 
         for l in range(self.num_layers):
+            in_dim = dims[l]
             if l + 1 in self.skip_in:
                 out_dim = dims[l + 1] - dims[0]
             else:
                 out_dim = dims[l + 1]
 
-            def create_linear_layer():
-                lin = nn.Linear(dims[l], out_dim)
-
-                if geometric_init:
-                    if l == self.num_layers - 1:
-                        if not inside_outside:
-                            torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                            torch.nn.init.constant_(lin.bias, -bias)
-                        else:
-                            torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                            torch.nn.init.constant_(lin.bias, bias)
-                    elif multires > 0 and l == 0:
-                        torch.nn.init.constant_(lin.bias, 0.0)
-                        torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
-                        torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    elif multires > 0 and l in self.skip_in:
-                        torch.nn.init.constant_(lin.bias, 0.0)
-                        torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                        torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
-                    else:
-                        torch.nn.init.constant_(lin.bias, 0.0)
-                        torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-
-                if weight_norm:
-                    lin = nn.utils.weight_norm(lin)
-
-                return lin
-
             if scenewise_split_type == 'interleave':
                 layer_is_scene_specific = l % 2 == 1
             elif scenewise_split_type == 'interleave_with_skips':
-                layer_is_scene_specific = l % 2 == 1 and dims[l] == out_dim
+                layer_is_scene_specific = l % 2 == 1 and in_dim == out_dim
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
             elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
@@ -109,8 +163,47 @@ class SDFNetwork(nn.Module):
                 raise ValueError(
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
 
+            def geometric_init_(weight, bias_):
+                if l == self.num_layers - 1:
+                    if not inside_outside:
+                        torch.nn.init.normal_(weight, mean=np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
+                        torch.nn.init.constant_(bias_, -bias)
+                    else:
+                        torch.nn.init.normal_(weight, mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
+                        torch.nn.init.constant_(bias_, bias)
+                elif multires > 0 and l == 0:
+                    torch.nn.init.constant_(bias_, 0.0)
+                    torch.nn.init.constant_(weight[:, 3:], 0.0)
+                    torch.nn.init.normal_(weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                elif multires > 0 and l in self.skip_in:
+                    torch.nn.init.constant_(bias_, 0.0)
+                    torch.nn.init.normal_(weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    torch.nn.init.constant_(weight[:, -(dims[0] - 3):], 0.0)
+                else:
+                    torch.nn.init.constant_(bias_, 0.0)
+                    torch.nn.init.normal_(weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+
+            def create_linear_layer():
+                layer = nn.Linear(in_dim, out_dim)
+                if geometric_init:
+                    geometric_init_(layer.weight, layer.bias)
+                if weight_norm:
+                    layer = nn.utils.weight_norm(layer)
+                return layer
+
             if layer_is_scene_specific:
-                lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
+                if scenewise_core_rank is None:
+                    lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
+                else:
+                    lin = LowRankMultiLinear(
+                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm)
+
+                    if geometric_init:
+                        for i in range(scenewise_core_rank):
+                            geometric_init_(
+                                lin.basis_weights['weight'][..., i],
+                                lin.basis_weights['bias'][..., i])
+
                 total_scene_specific_layers += 1
             else:
                 lin = create_linear_layer()
@@ -123,6 +216,8 @@ class SDFNetwork(nn.Module):
 
         self.activation = nn.Softplus(beta=100)
 
+        self.scenewise_lowrank = scenewise_core_rank is not None
+
     def forward(self, inputs, scene_idx):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
@@ -131,7 +226,7 @@ class SDFNetwork(nn.Module):
         x = inputs
         for l in range(self.num_layers):
             lin = self.linear_layers[l]
-            layer_is_scene_specific = type(lin) is torch.nn.ModuleList
+            layer_is_scene_specific = type(lin) is not torch.nn.Linear
 
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
@@ -178,6 +273,7 @@ class SDFNetwork(nn.Module):
             One of:
             - pick (take the 0th scene's 'subnetwork')
         """
+        raise NotImplementedError("switch_to_finetuning()")
         if algorithm == 'pick':
             for i in range(self.num_layers):
                 if type(self.linear_layers[i]) is nn.ModuleList:
@@ -194,6 +290,9 @@ class SDFNetwork(nn.Module):
                 1. scene-specific;
                 2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
             """
+            if self.scenewise_lowrank:
+                return False
+
             name = name.split('.')
 
             try:
@@ -229,6 +328,7 @@ class RenderingNetwork(nn.Module):
                  n_layers,
                  n_scenes,
                  scenewise_split_type='interleave',
+                 scenewise_core_rank=None,
                  weight_norm=True,
                  multires_view=0,
                  squeeze_out=True):
@@ -254,24 +354,18 @@ class RenderingNetwork(nn.Module):
 
         self.num_layers = len(dims) - 1
 
+        maybe_weight_norm = nn.utils.weight_norm if weight_norm else lambda x: x
+
         self.linear_layers = nn.ModuleList()
         total_scene_specific_layers = 0
 
         for l in range(0, self.num_layers):
-            out_dim = dims[l + 1]
-
-            def create_linear_layer():
-                lin = nn.Linear(dims[l], out_dim)
-
-                if weight_norm:
-                    lin = nn.utils.weight_norm(lin)
-
-                return lin
+            in_dim, out_dim = dims[l], dims[l + 1]
 
             if scenewise_split_type == 'interleave':
                 layer_is_scene_specific = l % 2 == 1
             elif scenewise_split_type == 'interleave_with_skips':
-                layer_is_scene_specific = l % 2 == 1 and dims[l] == out_dim
+                layer_is_scene_specific = l % 2 == 1 and in_dim == out_dim
             elif scenewise_split_type in ('append_half', 'replace_last_half'):
                 layer_is_scene_specific = l >= self.num_layers - num_scene_specific_layers
             elif scenewise_split_type in ('prepend_half', 'replace_first_half'):
@@ -281,10 +375,15 @@ class RenderingNetwork(nn.Module):
                     f"Wrong value for `scenewise_split_type`: '{scenewise_split_type}'")
 
             if layer_is_scene_specific:
-                lin = nn.ModuleList([create_linear_layer() for _ in range(n_scenes)])
+                if scenewise_core_rank is None:
+                    lin = nn.ModuleList(
+                        [maybe_weight_norm(nn.Linear(in_dim, out_dim)) for _ in range(n_scenes)])
+                else:
+                    lin = LowRankMultiLinear(
+                        n_scenes, in_dim, out_dim, scenewise_core_rank, weight_norm)
                 total_scene_specific_layers += 1
             else:
-                lin = create_linear_layer()
+                lin = maybe_weight_norm(nn.Linear(in_dim, out_dim))
 
             self.linear_layers.append(lin)
 
@@ -293,6 +392,8 @@ class RenderingNetwork(nn.Module):
             f"{self.num_layers}) scene-specific layers")
 
         self.relu = nn.ReLU()
+
+        self.scenewise_lowrank = scenewise_core_rank is not None
 
     def forward(self, points, normals, view_dirs, feature_vectors, scene_idx):
         if self.embedview_fn is not None:
@@ -311,7 +412,7 @@ class RenderingNetwork(nn.Module):
 
         for l in range(0, self.num_layers):
             lin = self.linear_layers[l]
-            layer_is_scene_specific = type(lin) is torch.nn.ModuleList
+            layer_is_scene_specific = type(lin) is not torch.nn.Linear
 
             if layer_is_scene_specific:
                 lin = lin[scene_idx]
@@ -340,10 +441,18 @@ class RenderingNetwork(nn.Module):
             One of:
             - pick (take the 0th scene's 'subnetwork')
         """
+        raise NotImplementedError("switch_to_finetuning()")
         if algorithm == 'pick':
             for i in range(self.num_layers):
-                if type(self.linear_layers[i]) is nn.ModuleList:
-                    self.linear_layers[i] = nn.ModuleList([self.linear_layers[i][0]])
+                if type(self.linear_layers[i]) is not nn.Linear: # layer is scene-specific
+                    layer_to_pick = self.linear_layers[i][0]
+
+                    # If we wanted to compute weights and revert to a regular `Linear` layer:
+                    # if type(self.linear_layers[i]) is LowRankMultiLinear:
+                    #     for p_name in 'weight', 'bias':
+                    #         nn.utils.parametrize.remove_parametrizations(layer_to_pick, p_name)
+
+                    self.linear_layers[i] = nn.ModuleList([layer_to_pick])
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
@@ -356,6 +465,9 @@ class RenderingNetwork(nn.Module):
                 1. scene-specific;
                 2. (if `scene_idx` is given) responsible for scene #`scene_idx`?
             """
+            if self.scenewise_lowrank:
+                return False
+
             name = name.split('.')
 
             try:
