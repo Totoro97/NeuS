@@ -507,6 +507,14 @@ class Runner:
             load_weights(self.color_network, checkpoint['color_network_fine'])
 
         if load_optimizer:
+            # Don't let overwrite custom keys
+            param_groups_ckpt = \
+                {g['group_name']: g for g in checkpoint['optimizer']['param_groups']}
+            for param_group in self.optimizer.param_groups:
+                for hyperparameter in 'base_learning_rate', 'weight_decay':
+                    param_groups_ckpt[param_group['group_name']][hyperparameter] = \
+                        param_group[hyperparameter]
+
             self.optimizer.load_state_dict(checkpoint['optimizer'])
             if self.use_fp16:
                 if 'gradient_scaler' in checkpoint:
