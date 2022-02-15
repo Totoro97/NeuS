@@ -294,9 +294,11 @@ class Runner:
         self.iter_step = self.restart_from_iter
 
         if self.finetune:
-            self.sdf_network.switch_to_finetuning()
-            self.color_network.switch_to_finetuning()
-            self.nerf_outside.switch_to_finetuning()
+            ALGORITHM = 'average'
+            with torch.no_grad():
+                self.sdf_network.switch_to_finetuning(ALGORITHM)
+                self.color_network.switch_to_finetuning(ALGORITHM)
+                self.nerf_outside.switch_to_finetuning(ALGORITHM)
 
         if not load_optimizer:
             self.optimizer = get_optimizer(parts_to_train)

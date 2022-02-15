@@ -272,12 +272,25 @@ class SDFNetwork(nn.Module):
             str
             One of:
             - pick (take the 0th scene's 'subnetwork')
+            - average (average weight tensors over all scenes)
         """
-        raise NotImplementedError("switch_to_finetuning()")
+        if self.scenewise_lowrank:
+            raise NotImplementedError("switch_to_finetuning()")
+
         if algorithm == 'pick':
             for i in range(self.num_layers):
                 if type(self.linear_layers[i]) is nn.ModuleList:
                     self.linear_layers[i] = nn.ModuleList([self.linear_layers[i][0]])
+        elif algorithm == 'average':
+            for i in range(self.num_layers):
+                if type(self.linear_layers[i]) is nn.ModuleList:
+                    new_layer = self.linear_layers[i][0]
+                    for param_name, _ in new_layer.named_parameters():
+                        averaged_param = torch.stack(
+                            [m.get_parameter(param_name) for m in self.linear_layers[i]]).mean(0)
+                        new_layer.get_parameter(param_name).copy_(averaged_param)
+
+                    self.linear_layers[i] = nn.ModuleList([new_layer])
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
@@ -440,8 +453,8 @@ class RenderingNetwork(nn.Module):
             str
             One of:
             - pick (take the 0th scene's 'subnetwork')
+            - average (average weight tensors over all scenes)
         """
-        raise NotImplementedError("switch_to_finetuning()")
         if algorithm == 'pick':
             for i in range(self.num_layers):
                 if type(self.linear_layers[i]) is not nn.Linear: # layer is scene-specific
@@ -453,6 +466,16 @@ class RenderingNetwork(nn.Module):
                     #         nn.utils.parametrize.remove_parametrizations(layer_to_pick, p_name)
 
                     self.linear_layers[i] = nn.ModuleList([layer_to_pick])
+        elif algorithm == 'average':
+            for i in range(self.num_layers):
+                if type(self.linear_layers[i]) is nn.ModuleList:
+                    new_layer = self.linear_layers[i][0]
+                    for param_name, _ in new_layer.named_parameters():
+                        averaged_param = torch.stack(
+                            [m.get_parameter(param_name) for m in self.linear_layers[i]]).mean(0)
+                        new_layer.get_parameter(param_name).copy_(averaged_param)
+
+                    self.linear_layers[i] = nn.ModuleList([new_layer])
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
 
@@ -586,7 +609,7 @@ class MultiSceneNeRF(nn.ModuleList):
             One of:
             - pick (take the 0th scene's 'subnetwork')
         """
-        if algorithm == 'pick':
+        if algorithm in ('pick', 'average'):
             super().__init__([self[0]])
         else:
             raise ValueError(f"Unknown algorithm: '{algorithm}'")
