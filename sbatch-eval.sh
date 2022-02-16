@@ -1,8 +1,12 @@
 #!/bin/bash
 
-#SBATCH --job-name eval-019
+# Extract mesh or render a video (set `--mode`).
+# Use the latest checkpoint in $DIR.
+# Ideally, $PORT should be different at each run.
+
+#SBATCH --job-name eval-132
 #SBATCH --output ./stdout/%A.txt
-#SBATCH --time 0-2
+#SBATCH --time 1:30:0
 
 #SBATCH -p htc,gpu #,gpu_devel
 #SBATCH --gres gpu:1
@@ -10,11 +14,17 @@
 #SBATCH --mem-per-gpu 13G
 
 #: '
-PORT=23102
+# Set these
+DIR=logs/gonzalo_100_layers1x_2GPU_ftTo132-3_initAvg
+PORT=23117
+
+# Don't set these
+LATEST_CKPT=`ls $DIR/checkpoints | tail -1`
 NPROC=1
-torchrun --standalone --nnodes=1 --nproc_per_node=$NPROC --master_port $PORT exp_runner.py \
-       --mode interpolate_8_28 \
-       --checkpoint_path logs/019_2022-02-14/checkpoints/ckpt_0220000.pth \
+torchrun \
+       --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py \
+       --mode validate_mesh \
+       --checkpoint_path $DIR/checkpoints/$LATEST_CKPT \
        --extra_config_args 'dataset { images_to_pick = [[0, "default"]] }'
 # '
 

@@ -1,25 +1,25 @@
 #!/bin/bash
 
-#SBATCH --job-name 100_rank50
-#SBATCH --output ./stdout/%A.txt
-#SBATCH --time 5-0
+# Train a 'metamodel' or a single-scene model.
 
-#SBATCH -p gpu #,gpu_devel
+#SBATCH --job-name 134
+#SBATCH --output ./stdout/%A.txt
+#SBATCH --time 3-0
+
+#SBATCH -p gpu #_a100 #,gpu_devel
 #SBATCH --gres gpu:2
 #SBATCH --cpus-per-gpu 2
 #SBATCH --mem-per-gpu 70G
 
 #: '
-CONF1=`mktemp`
+CONF=`mktemp`
 cp confs/gonzalo_100.conf $CONF1
 
-#-m cProfile -o 100_100iters.prof
-#nvprof --profile-from-start off -o 100_50scenes.nvprof
-PORT=25109
+PORT=25119
 NPROC=2
-torchrun --standalone --nnodes=1 --nproc_per_node=$NPROC --master_port $PORT exp_runner.py --mode train \
---conf $CONF1
-#--checkpoint_path logs/gonzalo_100_rank10/checkpoints/ckpt_0320000.pth \
-#--extra_config_args 'dataset { batch_size = ${train.batch_size} }, train { batch_size = 768 }'
+torchrun --rdzv_id $PORT --rdzv_endpoint 127.0.0.1:$PORT --nnodes=1 --nproc_per_node=$NPROC exp_runner.py --mode train \
+--conf $CONF
+#--checkpoint_path logs/100_rank50/checkpoints/ckpt_0110000.pth \
+#--extra_config_args 'general { base_exp_dir = ./logs/100_rank50_restart/ }, dataset { batch_size = ${train.batch_size} }, train { batch_size = 1024, learning_rate = 0.8e-3, warm_up_end = 1000 }'
 # '
 

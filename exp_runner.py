@@ -690,7 +690,8 @@ class Runner:
                 self.dataset.scale_mats_np[scene_idx][0][:3, 3][None]
 
         mesh = trimesh.Trimesh(vertices, triangles)
-        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
+        mesh.export(os.path.join(
+            self.base_exp_dir, 'meshes', '{}_{:0>8d}.ply'.format(scene_idx, self.iter_step)))
 
         logging.info('End')
 
@@ -760,9 +761,15 @@ if __name__ == '__main__':
 
     if args.mode == 'train':
         runner.train()
-    elif args.mode == 'validate_mesh':
+    elif args.mode.startswith('validate_mesh'):
+        try:
+            scene_idx = int(args.mode.split('_')[2])
+        except IndexError:
+            scene_idx = 0
+
         with torch.no_grad():
-            runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+            runner.validate_mesh(
+                scene_idx=scene_idx, world_space=True, resolution=512, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate_'):
         # Interpolate views given [optional: scene index and] two image indices
         arguments = args.mode.split('_')[1:]
