@@ -16,6 +16,8 @@ Preprocess videos from the "Gonzalo's dataset" for learning NeRF-like 3D portrai
 11. Триангулируем. Запоминаем. Можно туда же, где и кроп.
 12. Находим преобразование (регистрируем) к референсной сцене.
 """
+from typing import List
+
 from get_similarity_transform import get_similarity_transform
 
 import argparse
@@ -28,6 +30,7 @@ import sys
 import subprocess
 import pickle
 import shutil
+import random
 
 import torch
 import numpy as np
@@ -52,6 +55,9 @@ class ImageCropper:
     Checks if the face in the image has an open eye and detects landmarks.
     """
     class BlinkException(Exception):
+        pass
+
+    class NoFaceException(Exception):
         pass
 
     def __init__(self):
@@ -138,6 +144,9 @@ class ImageCropper:
         landmarks_list, _, face_rects = self.landmark_detector.get_landmarks_from_image(
             cv2.cvtColor(image, cv2.COLOR_BGR2RGB), return_bboxes=True)
 
+        if face_rects is None:
+            raise ImageCropper.NoFaceException
+
         best_face_rect_idx = self.choose_one_detection(face_rects, image_width=image.shape[1])
         landmarks = landmarks_list[best_face_rect_idx].tolist()
         face_rect = face_rects[best_face_rect_idx].tolist()
@@ -157,7 +166,7 @@ def run_subprocess(command, working_dir=None):
         sys.stdout.buffer.write(c)
 
 
-def preprocess_folders(folders: list[pathlib.Path]):
+def preprocess_folders(folders: List[pathlib.Path]):
     """
     Given a list of paths to scenes, preprocess each of them.
     One scene is a folder, e.g. '132/2021-07-22-12-24-33', which has the 'smartphone_video_frames'
@@ -455,9 +464,12 @@ def triangulate_anchor_landmarks(camera_matrices, landmarks_2d):
     landmarks_2d = landmarks_2d[:, ANCHOR_LANDMARK_IDXS, :2] # N, 6, 2
 
     # Triangulate 10 times (using a different pair each time), then median-average
-    camera_indices = \
-        [(i*2, len(camera_matrices) // 2 + i*2) for i in range(10)] # deterministic shuffle :)
-    landmarks_3d_guesses = [] # eventually 10, 6, 3
+    # camera_indices = \
+    #     [(i*2, len(camera_matrices) // 2 + i*2) for i in range(10)] # deterministic shuffle :)
+    camera_indices = list(range(len(camera_matrices)))
+    random.shuffle(camera_indices)
+    camera_indices = list(zip(camera_indices[::2], camera_indices[1::2]))
+    landmarks_3d_guesses = []  # eventually 10, 6, 3
 
     for cam1_idx, cam2_idx in camera_indices:
         landmarks_3d_guess = cv2.triangulatePoints(               # 4, 6
