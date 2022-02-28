@@ -57,6 +57,8 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_vie
     output_images_path.mkdir(exist_ok=True)
     output_masks_path.mkdir(exist_ok=True)
 
+    logger.info(f"Output path: {output_path}")
+
     views_config_id = str(num_views)
     views_idx = h3ds.helper._config['scenes'][scene_id]['default_views_configs'][views_config_id]
     labels = ['{0:04}'.format(idx) for idx in views_idx]
@@ -120,9 +122,11 @@ def preprocess_folder(folder: pathlib.Path, image_cropper: ImageCropper, num_vie
     # and then reuse 'scale_mat_XX' from the reference scene.
     resave_cameras_npz(camera_matrices, registration_transform, cameras_sphere_npz_path)
 
-    # todo resave gt mesh
-    # logger.info(f"Saving gt mesh in reference coordinates: {registration_transform.tolist()}")
-
+    # mesh_original = Ref_transform @ mesh_transformed
+    # mesh_transformed = Ref_transform^-1 @ mesh_original
+    mesh.apply_transform(np.linalg.inv(registration_transform))
+    mesh.export(output_path / "mesh.ply")
+    logger.info(f"Saving gt mesh in reference coordinates: {registration_transform.tolist()}")
 
 if __name__ == '__main__':
     # python preprocess.py --folders f1 f2 f3 f4 f5
