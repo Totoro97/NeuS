@@ -39,7 +39,7 @@ class MeshEvaluator:
             assert is_main_process()
             samples_gt, normals_gt = sample_points_from_meshes(self.mesh_gt, num_samples=self.num_samples,
                                                                return_normals=True)  # (1, n, 3), (1, n, 3)
-            torch.save(torch.cat([self.samples_gt, self.normals_gt], dim=0).cpu(), cache_path)
+            torch.save(torch.cat([samples_gt, normals_gt], dim=0).cpu(), cache_path)
             if get_world_size() > 1:
                 synchronize()
 
