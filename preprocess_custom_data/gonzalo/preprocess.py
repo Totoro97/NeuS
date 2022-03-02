@@ -528,6 +528,9 @@ def resave_cameras_npz(
 
     dict_to_save = {}
     for camera_idx, camera_matrix in enumerate(camera_matrices):
+        dict_to_save[f'reg_mat_{camera_idx}'] = registration_transform
+        dict_to_save[f'cam_mat_{camera_idx}'] = camera_matrix
+        dict_to_save[f'ref_mat_{camera_idx}'] = REFERENCE_SCALE_TRANSFORM
         dict_to_save[f'world_mat_{camera_idx}'] = camera_matrix @ registration_transform
         dict_to_save[f'scale_mat_{camera_idx}'] = REFERENCE_SCALE_TRANSFORM
 
