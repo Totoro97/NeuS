@@ -16,25 +16,23 @@ Preprocess videos from the "Gonzalo's dataset" for learning NeRF-like 3D portrai
 11. Триангулируем. Запоминаем. Можно туда же, где и кроп.
 12. Находим преобразование (регистрируем) к референсной сцене.
 """
+import argparse
+import bisect
+import csv
+import logging
+import pathlib
+import pickle
+import random
+import shutil
+import subprocess
+import sys
+import time
 from typing import List
 
-from get_similarity_transform import get_similarity_transform
-
-import argparse
-import pathlib
-import logging
-import time
-import csv
-import bisect
-import sys
-import subprocess
-import pickle
-import shutil
-import random
-
-import torch
-import numpy as np
 import cv2
+import numpy as np
+
+from get_similarity_transform import get_similarity_transform
 
 try:
     import face_alignment
@@ -467,7 +465,7 @@ def triangulate_anchor_landmarks(camera_matrices, landmarks_2d):
     # camera_indices = \
     #     [(i*2, len(camera_matrices) // 2 + i*2) for i in range(10)] # deterministic shuffle :)
     camera_indices = list(range(len(camera_matrices)))
-    random.shuffle(camera_indices)
+    random.Random(4).shuffle(camera_indices)
     camera_indices = list(zip(camera_indices[::2], camera_indices[1::2]))
     landmarks_3d_guesses = []  # eventually 10, 6, 3
 
