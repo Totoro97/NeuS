@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 import torch.utils.data
 import cv2 as cv
@@ -99,7 +101,7 @@ class Dataset(torch.utils.data.Dataset):
         render_cameras_name = conf.get_string('render_cameras_name')
 
         def load_one_scene(
-            root_dir: pathlib.Path, images_to_pick: list[str] = 'default', kind: str = 'train'):
+            root_dir: pathlib.Path, images_to_pick: List[str] = 'default', kind: str = 'train'):
             """
             images_to_pick
                 list of str

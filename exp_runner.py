@@ -1,3 +1,5 @@
+from typing import List
+
 from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, MultiSceneNeRF
 from models.renderer import NeuSRenderer
@@ -475,7 +477,7 @@ class Runner:
             copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
     def load_checkpoint(self,
-        checkpoint: dict, parts_to_skip_loading: list[str] = [], load_optimizer: bool = True):
+        checkpoint: dict, parts_to_skip_loading: List[str] = [], load_optimizer: bool = True):
 
         def load_weights(module, state_dict):
             # backward compatibility:
