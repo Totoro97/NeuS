@@ -683,15 +683,31 @@ class Runner:
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
 
-        vertices, triangles =self.renderer.extract_geometry(
+        vertices, triangles = self.renderer.extract_geometry(
             scene_idx, bound_min, bound_max, resolution=resolution, threshold=threshold)
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
+
+        vertex_colors = []
+        k = 10000
+        with torch.no_grad():
+            for i in range(vertices.shape[0] // k + 1):
+                if i * k >= vertices.shape[0]:
+                    break
+                pts = torch.tensor(vertices[i * k: (i + 1) * k], dtype=torch.float32, device=self.device)
+                sdf_nn_output = self.sdf_network(pts, scene_idx)
+                feature_vector = sdf_nn_output[:, 1:]
+                gradients = self.sdf_network.gradient(pts, scene_idx).squeeze()
+                dirs = gradients
+                vertex_colors.append(self.color_network(pts, gradients, dirs, feature_vector, scene_idx).cpu().numpy())
+        vertex_colors = np.concatenate(vertex_colors, axis=0)
+        vertex_colors = np.uint8(np.round(vertex_colors * 255))
+        vertex_colors = vertex_colors[:, ::-1]  # bgr to rgb
 
         if world_space:
             vertices = vertices * self.dataset.scale_mats_np[scene_idx][0][0, 0] + \
                 self.dataset.scale_mats_np[scene_idx][0][:3, 3][None]
 
-        mesh = trimesh.Trimesh(vertices, triangles)
+        mesh = trimesh.Trimesh(vertices, triangles, vertex_colors=vertex_colors)
         mesh.export(os.path.join(
             self.base_exp_dir, 'meshes', '{}_{:0>8d}.ply'.format(scene_idx, self.iter_step)))
 
