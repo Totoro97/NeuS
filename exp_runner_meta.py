@@ -1,4 +1,5 @@
 import os
+import pdb
 import time
 import logging
 import argparse
@@ -15,26 +16,158 @@ from pyhocon import ConfigFactory
 from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
+from copy import deepcopy
+from torch import multiprocessing as mp
+import queue
 
-# Inspired by https://github.com/gabrielhuang/reptile-pytorch/blob/master/reptile_sine.ipynb
-def do_base_learning(model, data, lr_inner, n_inner):
-    new_model = None 
+
+class MetaWeights:
+    """Class to consolidate."""
+    def __init__(self, conf):
+        self.conf = conf
+        # Initial weights are random
+        self.nerf_sd = NeRF(**self.conf['model.nerf']).state_dict()
+        self.sdf_sd = SDFNetwork(**self.conf['model.sdf_network']).state_dict()
+        self.deviation_sd = SingleVarianceNetwork(**self.conf['model.variance_network']).state_dict()
+        self.color_sd = RenderingNetwork(**self.conf['model.rendering_network']).state_dict()
+
+        self.epsilon = conf['meta.epsilon']
+        self.base_exp_dir = conf['meta.base_exp_dir']
+        self.iter_step = 0
+        self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+
+    def get_state_dicts(self):
+        """This dict of state_dicts is passed to each process."""
+        return {
+            'nerf': self.nerf_sd,
+            'sdf': self.sdf_sd,
+            'deviation': self.deviation_sd,
+            'color': self.color_sd
+        }
+
+    @torch.no_grad()
+    def update(self, sd_infos: list):
+        """
+        Allows batch updates.
+
+        sd_infos is a list of dictionaries of state_dicts.
+        Each entry of sd_infos should be a dictionary returned by
+        runner:get_state_dicts() (same format as this classes get_state_dicts().
+
+        The runner:get_state_dicts() returns JUST the weights of the
+        network at the end of training.
+        """
+        # Accumulate render weights
+        for network in ["nerf", "sdf", "deviation", "color"]:
+            avg_weights = self.average_dicts([info[network] for info in sd_infos])
+            neg_grad = self.subtract_dicts(avg_weights, getattr(self, network + "_sd"))
+            # TODO: we could apply a fancier optimizer with neg_grad
+            # TODO: instead we just add it, like SGD
+            # TODO: this had the best performance in the meta-nerf paper
+            new_sd = self.add_dicts_w_epsilon(getattr(self, network + "_sd"), neg_grad)
+            setattr(self, "network" + "_sd", new_sd)
+
+        self.iter_step += 1
+
+    def average_dicts(self, ds: list):
+        """Given nn.state_dicts on the same device, average them.
+
+        NOTE: replaces the first dicts info with the average.
+        """
+        for d_idx in range(1, len(ds)):
+            for key in ds[0]:
+                with torch.no_grad():
+                    ds[0][key] += ds[d_idx][key]
+
+        for key in ds[0]:
+            with torch.no_grad():
+                ds[0][key] = (ds[0][key] / len(ds)).to(ds[0][key].dtype)
+        return ds[0]
+
+    def subtract_dicts(self, d1, d2):
+        """Given nn.state_dicts on the same device, subtract them.
+
+        NOTE: replaces the first dicts info wih the result (in-place)."""
+        for key in d1:
+            with torch.no_grad():
+                d1[key] -= d2[key]
+        return d1
+
+    def add_dicts_w_epsilon(self, d1, d2):
+        """Again, in place, performs SGD update."""
+        for key in d1:
+            with torch.no_grad():
+                d1[key] += (self.epsilon * d2[key]).to(d1[key].dtype)
+        return d1
+
+    def save_checkpoint(self):
+        """Copied over from the Runner class.
+
+        NOTE: this doesn't save an optim.
+        """
+        checkpoint = {
+            'nerf': self.nerf_sd,
+            'sdf_network_fine': self.sdf_sd,
+            'variance_network_fine': self.deviation_sd,
+            'color_network_fine': self.color_sd,
+            'iter_step': self.iter_step,
+        }
+
+        os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
+        torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
+
+    def writer_write(self, stats):
+        for k, v in stats.items():
+            self.writer.add_scalar(k, v, self.iter_step)
+
+
+def read_conf(conf_path, case):
+    f = open(conf_path)
+    conf_text = f.read()
+    conf_text = conf_text.replace('CASE_NAME', case)
+    f.close()
+
+    conf = ConfigFactory.parse_string(conf_text)
+    return conf
+
+
+class AverageDict:
+    """Just to be compatible with SummaryWriter."""
+    def __init__(self):
+        self.stats = {}
+
+    def add_scalar(self, name, value, _):
+        if name not in self.stats:
+            self.stats[name] = []
+        self.stats[name].append(float(value))
+
+    def get_summary(self, from_idx=0):
+        ret_dict = {}
+        for name in self.stats:
+            ret_dict[name] = np.array(self.stats[name][from_idx:]).mean()
+        return ret_dict
+
 
 class Runner:
-    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
+    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False,
+                 initial_weights: dict = None, conf=None, no_save=False
+                 ):
         self.device = torch.device('cuda')
+        if not conf:
+            # Configuration
+            self.conf_path = conf_path
+            f = open(self.conf_path)
+            conf_text = f.read()
+            conf_text = conf_text.replace('CASE_NAME', case)
+            f.close()
+            self.conf = ConfigFactory.parse_string(conf_text)
+        else:
+            self.conf = conf
 
-        # Configuration
-        self.conf_path = conf_path
-        f = open(self.conf_path)
-        conf_text = f.read()
-        conf_text = conf_text.replace('CASE_NAME', case)
-        f.close()
-
-        self.conf = ConfigFactory.parse_string(conf_text)
+        self.no_save = no_save
         self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
         self.base_exp_dir = self.conf['general.base_exp_dir']
-        os.makedirs(self.base_exp_dir, exist_ok=True)
+        # os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
         self.iter_step = 0
 
@@ -66,6 +199,12 @@ class Runner:
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
+        if initial_weights is not None:
+            self.nerf_outside.load_state_dict(initial_weights['nerf'])
+            self.sdf_network.load_state_dict(initial_weights['sdf'])
+            self.deviation_network.load_state_dict(initial_weights['deviation'])
+            self.color_network.load_state_dict(initial_weights['color'])
+
         params_to_train += list(self.nerf_outside.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
@@ -79,32 +218,43 @@ class Runner:
                                      self.color_network,
                                      **self.conf['model.neus_renderer'])
 
-        # Load checkpoint
-        latest_model_name = None
-        if is_continue:
-            model_list_raw = os.listdir(os.path.join(self.base_exp_dir, 'checkpoints'))
-            model_list = []
-            for model_name in model_list_raw:
-                if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
-                    model_list.append(model_name)
-            model_list.sort()
-            latest_model_name = model_list[-1]
+        if not self.no_save:
+            # Load checkpoint
+            latest_model_name = None
+            if is_continue:
+                model_list_raw = os.listdir(os.path.join(self.base_exp_dir, 'checkpoints'))
+                model_list = []
+                for model_name in model_list_raw:
+                    if model_name[-3:] == 'pth' and int(model_name[5:-4]) <= self.end_iter:
+                        model_list.append(model_name)
+                model_list.sort()
+                latest_model_name = model_list[-1]
 
-        if latest_model_name is not None:
-            logging.info('Find checkpoint: {}'.format(latest_model_name))
-            self.load_checkpoint(latest_model_name)
+            if latest_model_name is not None:
+                logging.info('Find checkpoint: {}'.format(latest_model_name))
+                self.load_checkpoint(latest_model_name)
 
-        # Backup codes and configs for debug
-        if self.mode[:5] == 'train':
-            self.file_backup()
+    def get_state_dicts(self, device=None):
+        if device is None:
+            device = self.device
+        return {
+            'nerf': self.nerf_outside.to(device).state_dict(),
+            'sdf': self.sdf_network.to(device).state_dict(),
+            'deviation': self.deviation_network.to(device).state_dict(),
+            'color': self.color_network.to(device).state_dict()
+        }
 
     def train(self):
-        self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+        if self.no_save:
+            self.writer = AverageDict()
+        else:
+            self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
+
         self.update_learning_rate()
         res_step = self.end_iter - self.iter_step
         image_perm = self.get_image_perm()
 
-        for iter_i in tqdm(range(res_step)):
+        for iter_i in range(res_step):
             data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
             rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
@@ -158,23 +308,26 @@ class Runner:
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
 
-            if self.iter_step % self.report_freq == 0:
-                print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+            if not self.no_save:
+                if self.iter_step % self.report_freq == 0:
+                    print(self.base_exp_dir)
+                    print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-            if self.iter_step % self.save_freq == 0:
-                self.save_checkpoint()
+                if self.iter_step % self.save_freq == 0:
+                    self.save_checkpoint()
 
-            if self.iter_step % self.val_freq == 0:
-                self.validate_image()
+                if self.iter_step % self.val_freq == 0:
+                    self.validate_image()
 
-            if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                if self.iter_step % self.val_mesh_freq == 0:
+                    self.validate_mesh()
 
             self.update_learning_rate()
 
             if self.iter_step % len(image_perm) == 0:
                 image_perm = self.get_image_perm()
+
+        return self.writer
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
@@ -196,26 +349,12 @@ class Runner:
         for g in self.optimizer.param_groups:
             g['lr'] = self.learning_rate * learning_factor
 
-    def file_backup(self):
-        dir_lis = self.conf['general.recording']
-        os.makedirs(os.path.join(self.base_exp_dir, 'recording'), exist_ok=True)
-        for dir_name in dir_lis:
-            cur_dir = os.path.join(self.base_exp_dir, 'recording', dir_name)
-            os.makedirs(cur_dir, exist_ok=True)
-            files = os.listdir(dir_name)
-            for f_name in files:
-                if f_name[-3:] == '.py':
-                    copyfile(os.path.join(dir_name, f_name), os.path.join(cur_dir, f_name))
-
-        copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
-
     def load_checkpoint(self, checkpoint_name):
         checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
         self.nerf_outside.load_state_dict(checkpoint['nerf'])
         self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
         self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
         self.color_network.load_state_dict(checkpoint['color_network_fine'])
-        # Could have no optim if loaded from meta weights
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.iter_step = checkpoint['iter_step']
@@ -372,33 +511,118 @@ class Runner:
         writer.release()
 
 
-if __name__ == '__main__':
-    print('Hello Wooden')
+def device_runner(receive_queue, return_queue, conf, device_num):
+    """
+    Method to call to run a process.
 
+    receive_queue:
+        Gets info from the main process used to run an experiment.
+    return_queue:
+        Returns the weights / stats / anything else to main process.
+    conf:
+        Used for all experiments.
+    """
+    print(f"{os.getpid()}: Started meta-learning handle, GPU {device_num}")
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    torch.cuda.set_device(f"cuda:{device_num}")
 
+    while True:
+        value = receive_queue.get()
+        # Stop flag
+        if value is None:
+            break
+        case, initial_weights = value
+
+        # Train
+        print(f"{os.getpid()}: Creating runner with case {case}")
+        runner = Runner(
+            None, "train", case, False, initial_weights=initial_weights, conf=conf, no_save=True
+        )
+        print(f"{os.getpid()}: Begin training")
+        stats = runner.train()
+        print(f"{os.getpid()}: End training, sending weights")
+
+        # Average losses over the last 10 iterations
+        stats = stats.get_summary(from_idx=-10)
+        # Return on CPU, to prevent OOM (averaging seems very fast on CPU anyway)
+        return_queue.put((os.getpid(), runner.get_state_dicts(device="cpu"), stats))
+
+
+def train_meta_iter(mweights: MetaWeights, send_qs, ret_q, cases):
+    """Train for a single iteration."""
+    # Send the dataset name and initial weights to all processes
+    w = mweights.get_state_dicts()
+    for sq, case in zip(send_qs, cases):
+        sq.put((case, w))
+
+    # Get the weights and summary from all processes
+    sd_infos = []
+    stats = AverageDict()
+    for _ in range(len(send_qs)):
+        # Will deadlock if a sub-process crashes
+        pid, info, stat = ret_q.get(block=True)
+        print(f"Main: Received weights from {pid}")
+        sd_infos.append(info)
+        for k, v in stat.items():
+            stats.add_scalar(k, v, None)
+    stats = stats.get_summary()
+
+    mweights.writer_write(stats)
+    mweights.update(sd_infos)
+    print("Main: Updated weights")
+    return stats
+
+
+def main():
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--conf', type=str, default='./confs/base.conf')
-    parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--case', type=str, default='')
 
     args = parser.parse_args()
+    meta_conf = read_conf(args.conf, args.case)
+    mweights = MetaWeights(meta_conf)
+    mp.set_start_method("spawn")
+    print("Sharing: ", torch.multiprocessing.get_sharing_strategy())
+    print("Num devices: ", torch.cuda.device_count())
 
-    torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    # Set up processes
+    ret_q = mp.Queue()
+    send_qs = []
+    processes = []
+    for idx, d_num in enumerate(range(torch.cuda.device_count())):
+        send_qs.append(mp.SimpleQueue())
+        processes.append(mp.Process(
+            target=device_runner,
+            args=(send_qs[-1], ret_q, meta_conf, d_num)
+        ))
+        print(f"Main: Starting process {idx}")
+        processes[-1].start()
 
-    if args.mode == 'train':
-        runner.train()
-    elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
-    elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
-        _, img_idx_0, img_idx_1 = args.mode.split('_')
-        img_idx_0 = int(img_idx_0)
-        img_idx_1 = int(img_idx_1)
-        runner.interpolate_view(img_idx_0, img_idx_1)
+    for iter_idx in range(meta_conf["meta.num_outer_iter"]):
+        # TODO: Decide how to distribute cases, for now send same to all sub-processes
+        cases = ["thin_catbus"] * len(send_qs)
+
+        stats = train_meta_iter(mweights, send_qs, ret_q, cases)
+        print(f"{iter_idx}: {stats['Loss/loss']}")
+
+        # TODO: set save freq
+        # mweights.save_checkpoint()
+
+    # Shutdown flag
+    for sq in send_qs:
+        sq.put(None)
+    for p in processes:
+        p.join()
+
+
+if __name__ == '__main__':
+    print('Hello Wooden')
+    main()
+
+
