@@ -66,7 +66,7 @@ And you may need to clean it by yourself (here we use Meshlab to clean it manual
 
 ![interest_sparse_points](./static/interest_sparse_points.png)
 
-Save it as `${data_dir}/sparse_point_interest.ply`.
+Save it as `${data_dir}/sparse_points_interest.ply`.
 
 Then run the commands:
 
