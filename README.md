@@ -54,13 +54,13 @@ pip install -r requirements.txt
 
 ### Running
 
-- **Training without mask**
+- **Training without masks**
 
 ```shell
 python exp_runner.py --mode train --conf ./confs/womask.conf --case <case_name>
 ```
 
-- **Training with mask**
+- **Training with masks**
 
 ```shell
 python exp_runner.py --mode train --conf ./confs/wmask.conf --case <case_name>
