@@ -43,12 +43,15 @@ pip install -r requirements.txt
   - torch==1.8.0
   - opencv_python==4.5.2.52
   - trimesh==3.9.8 
-  - numpy==1.19.2
+  - numpy==1.19.3
   - pyhocon==0.3.57
   - icecream==2.1.0
   - tqdm==4.50.2
   - scipy==1.7.0
   - PyMCubes==0.1.2
+  - imageio==2.26.0
+  - scikit-image==0.20.0
+  - tensorboard==2.12.0
 
 </details>
 
