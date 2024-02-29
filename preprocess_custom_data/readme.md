@@ -17,7 +17,7 @@ We take the images in `examples/thin_catbus` for example. These images were capt
 Dependencies: 
 
 - cnpy (https://github.com/rogersce/cnpy)
-- OpenCV
+- OpenCV <= 4.6.0
 
 Run commands
 
