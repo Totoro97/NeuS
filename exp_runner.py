@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import argparse
 import numpy as np
@@ -15,12 +16,17 @@ from pyhocon import ConfigFactory
 from models.dataset import Dataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
-
+import sys
 
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
-        self.device = torch.device('cuda')
-
+        # self.device = torch.device('cuda')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if self.device =="cuda" and torch_version < "2.":
+            if torch.cuda.device_count() > 1:
+                print(f"Using {torch.cuda.device_count()} GPUs")
+        
         # Configuration
         self.conf_path = conf_path
         f = open(self.conf_path)
@@ -33,6 +39,24 @@ class Runner:
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
+        
+        def serialize(obj, possible_keys=['data_dir', 
+                                          'render_cameras_name',
+                                          'object_cameras_name',
+                                          'n_images',
+                                          'image_indices']):
+            if isinstance(obj, torch.Tensor):
+                return obj.tolist()  # Convert PyTorch tensor to a list
+            if isinstance(obj, list):
+                return [serialize(item) for item in obj]  # Recursively serialize lists
+            if hasattr(obj, '__dict__'):
+                return {key: serialize(value) for key, value in obj.__dict__.items() if key in possible_keys}  # Convert objects recursively
+            return obj  # Keep other data as is
+        dataset_path = os.path.join(self.base_exp_dir, "dataset_info.json")
+        dataset_serializable = serialize(self.dataset)
+        with open(dataset_path, "w") as json_file:
+            json.dump(dataset_serializable, json_file, indent=4)
+            
         self.iter_step = 0
 
         # Training parameters
@@ -94,6 +118,13 @@ class Runner:
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
             self.file_backup()
+            
+        if self.device == "cuda":
+            if torch.cuda.device_count() > 1:
+                self.nerf_outside = torch.nn.DataParallel(self.nerf_outside)
+                self.sdf_network = torch.nn.DataParallel(self.sdf_network)
+                self.deviation_network = torch.nn.DataParallel(self.deviation_network)
+                self.color_network = torch.nn.DataParallel(self.color_network)
 
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
@@ -104,7 +135,11 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            rays_o, rays_d, true_rgb, mask = data[:, :3].to(self.device), \
+                                 data[:, 3:6].to(self.device), \
+                                 data[:, 6:9].to(self.device), \
+                                 data[:, 9:10].to(self.device)
+
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -369,23 +404,45 @@ class Runner:
 
 if __name__ == '__main__':
     print('Hello Wooden')
+    
+    torch_version = torch.__version__.split("+")[0]
+    print(f"torch version: {torch_version}")
 
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on : {device}")
 
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
 
+    # Filter out Jupyter-specific arguments
+    sys.argv = [arg for arg in sys.argv if not arg.startswith('--f=')]
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--conf', type=str, default='./confs/base.conf')
+    parser.add_argument('--conf', type=str, default='./confs/project_DTU.conf')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--case', type=str, default='')
+    parser.add_argument('--case', type=str, default='scan24')
 
     args = parser.parse_args()
-
-    torch.cuda.set_device(args.gpu)
+    
+    if torch_version < "2." :
+        if torch.cuda.is_available() :
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            if torch.cuda.device_count()==1 :
+                print(f"Using GPU {args.gpu}")
+                torch.cuda.set_device(args.gpu)
+        else:
+            torch.set_default_tensor_type('torch.FloatTensor')
+            
+    if torch_version >= "2." :
+        # Set default data type
+        torch.set_default_dtype(torch.float32)
+        # Set default device
+        torch.set_default_device('cuda')
+        
     runner = Runner(args.conf, args.mode, args.case, args.is_continue)
 
     if args.mode == 'train':

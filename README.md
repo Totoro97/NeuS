@@ -31,6 +31,8 @@ Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/l
 
 Clone this repository
 
+Create a python environment with **version 3.8** !
+
 ```shell
 git clone https://github.com/Totoro97/NeuS.git
 cd NeuS
@@ -64,6 +66,14 @@ python exp_runner.py --mode train --conf ./confs/womask.conf --case <case_name>
 
 ```shell
 python exp_runner.py --mode train --conf ./confs/wmask.conf --case <case_name>
+```
+
+- **Train on DTU data (PROJECT)**
+
+After running the `download_data.sh`bash file, you can run the following instruction:
+
+```shell
+python exp_runner.py --mode train --conf ./confs/project_DTU.conf --case scan<id>
 ```
 
 - **Extract surface from trained model** 

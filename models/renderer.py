@@ -207,7 +207,7 @@ class NeuSRenderer:
 
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)  
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints

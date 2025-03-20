@@ -38,7 +38,8 @@ class Dataset:
     def __init__(self, conf):
         super(Dataset, self).__init__()
         print('Load data: Begin')
-        self.device = torch.device('cuda')
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.conf = conf
 
         self.data_dir = conf.get_string('data_dir')
@@ -56,12 +57,10 @@ class Dataset:
         self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
 
-        # world_mat is a projection matrix from world to image
         self.world_mats_np = [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
         self.scale_mats_np = []
 
-        # scale_mat: used for coordinate normalization, we assume the scene to render is inside a unit sphere at origin.
         self.scale_mats_np = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.n_images)]
 
         self.intrinsics_all = []
@@ -71,70 +70,68 @@ class Dataset:
             P = world_mat @ scale_mat
             P = P[:3, :4]
             intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
-            self.pose_all.append(torch.from_numpy(pose).float())
+            self.intrinsics_all.append(torch.from_numpy(intrinsics).float().to(self.device))
+            self.pose_all.append(torch.from_numpy(pose).float().to(self.device))
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
-        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).to(self.device)
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).to(self.device)
+        self.intrinsics_all = torch.stack(self.intrinsics_all)
+        self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        self.pose_all = torch.stack(self.pose_all)
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
         object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
         object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # Object scale mat: region of interest to **extract mesh**
         object_scale_mat = np.load(os.path.join(self.data_dir, self.object_cameras_name))['scale_mat_0']
         object_bbox_min = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_min[:, None]
         object_bbox_max = np.linalg.inv(self.scale_mats_np[0]) @ object_scale_mat @ object_bbox_max[:, None]
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
 
+        subsample = float(conf.get_string('subsample', '1.'))
+        if subsample:
+            self.n_images = int(self.n_images*subsample)
+            self.image_indices = torch.randperm(self.images.size(0))[:self.n_images]
+            self.images = self.images[self.image_indices]
+            self.masks = self.masks[self.image_indices]
+            self.intrinsics_all_inv = self.intrinsics_all_inv[self.image_indices]
+            self.pose_all = self.pose_all[self.image_indices]
         print('Load data: End')
-
+        
     def gen_rays_at(self, img_idx, resolution_level=1):
-        """
-        Generate rays at world space from one camera.
-        """
         l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
+        tx = torch.linspace(0, self.W - 1, self.W // l, device=self.device)
+        ty = torch.linspace(0, self.H - 1, self.H // l, device=self.device)
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1) # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
-        rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
-        rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)  # W, H, 3
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, None, :3, :3], p[:, :, :, None]).squeeze()
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
+        rays_v = torch.matmul(self.pose_all[img_idx, None, None, :3, :3], rays_v[:, :, :, None]).squeeze()
+        rays_o = self.pose_all[img_idx, None, None, :3, 3].expand(rays_v.shape)
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
     def gen_random_rays_at(self, img_idx, batch_size):
-        """
-        Generate random rays at world space from one camera.
-        """
-        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
-        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
-        color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
-        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
-        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
-        rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
-        rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        pixels_x = torch.randint(low=0, high=self.W, size=[batch_size], device=self.device)
+        pixels_y = torch.randint(low=0, high=self.H, size=[batch_size], device=self.device)
+        color = self.images[img_idx][(pixels_y, pixels_x)]
+        mask = self.masks[img_idx][(pixels_y, pixels_x)]
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()
+        p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze()
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
+        rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()
+        rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape)
 
+        return torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1)
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
-        """
-        Interpolate pose between two cameras.
-        """
         l = resolution_level
-        tx = torch.linspace(0, self.W - 1, self.W // l)
-        ty = torch.linspace(0, self.H - 1, self.H // l)
+        tx = torch.linspace(0, self.W - 1, self.W // l, device=self.device)
+        ty = torch.linspace(0, self.H - 1, self.H // l, device=self.device)
         pixels_x, pixels_y = torch.meshgrid(tx, ty)
-        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)  # W, H, 3
-        p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()  # W, H, 3
-        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)  # W, H, 3
+        p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1)
+        p = torch.matmul(self.intrinsics_all_inv[0, None, None, :3, :3], p[:, :, :, None]).squeeze()
+        rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)
         trans = self.pose_all[idx_0, :3, 3] * (1.0 - ratio) + self.pose_all[idx_1, :3, 3] * ratio
         pose_0 = self.pose_all[idx_0].detach().cpu().numpy()
         pose_1 = self.pose_all[idx_1].detach().cpu().numpy()
@@ -151,10 +148,10 @@ class Dataset:
         pose[:3, :3] = rot.as_matrix()
         pose[:3, 3] = ((1.0 - ratio) * pose_0 + ratio * pose_1)[:3, 3]
         pose = np.linalg.inv(pose)
-        rot = torch.from_numpy(pose[:3, :3]).cuda()
-        trans = torch.from_numpy(pose[:3, 3]).cuda()
-        rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()  # W, H, 3
-        rays_o = trans[None, None, :3].expand(rays_v.shape)  # W, H, 3
+        rot = torch.from_numpy(pose[:3, :3]).to(self.device)
+        trans = torch.from_numpy(pose[:3, 3]).to(self.device)
+        rays_v = torch.matmul(rot[None, None, :3, :3], rays_v[:, :, :, None]).squeeze()
+        rays_o = trans[None, None, :3].expand(rays_v.shape)
         return rays_o.transpose(0, 1), rays_v.transpose(0, 1)
 
     def near_far_from_sphere(self, rays_o, rays_d):
